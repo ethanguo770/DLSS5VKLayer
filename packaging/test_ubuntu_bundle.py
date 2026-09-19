@@ -11,11 +11,234 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parent.parent
+
+
+def load_builder():
+    spec = importlib.util.spec_from_file_location('bundle_builder', REPO / 'packaging/make-ubuntu-bundle.py')
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    return builder
+
+
+class BundlePublicationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='dlssnr-publication-')
+        self.base = Path(self.temporary.name)
+        self.output = self.base / 'dist'
+        self.output.mkdir()
+        self.builder = load_builder()
+        self.args = SimpleNamespace(output_dir=self.output, name='dlssnr-ubuntu22.04-x86_64')
+        self.destination = self.output / self.args.name
+        self.archive = self.output / (self.args.name + '.tar.gz')
+        self.checksum = self.output / (self.args.name + '.tar.gz.sha256')
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def make_bundle(self, root, payload):
+        for relative in ['DLSSNR', 'helper/dlssnr_helper.exe', 'layer/libVkLayer_NV_dlssnr.so']:
+            file = root / relative
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(payload)
+        (root / 'bundle-metadata.json').write_text(json.dumps({
+            'target': 'Ubuntu 22.04 x86_64', 'wine_version': self.builder.WINE_VERSION,
+            'runtime_dll_pins': {'DXVK_VERSION': 'test', 'DXVK_NVAPI_VERSION': 'test'}}))
+
+    def package(self, payload=b'new'):
+        with mock.patch.object(self.builder, 'build',
+                               side_effect=lambda args, repo, root: self.make_bundle(root, payload)):
+            return self.builder.package(self.args, REPO)
+
+    def snapshot(self):
+        return {file.relative_to(self.output).as_posix(): file.read_bytes()
+                for file in self.output.rglob('*') if file.is_file()}
+
+    def test_repeated_build_replaces_directory_archive_and_checksum(self):
+        self.package(b'old')
+        (self.destination / 'obsolete.txt').write_bytes(b'remove with old package')
+        self.package(b'new')
+        self.assertEqual((self.destination / 'DLSSNR').read_bytes(), b'new')
+        self.assertFalse((self.destination / 'obsolete.txt').exists())
+        with self.builder.tarfile.open(self.archive) as archive:
+            self.assertEqual(archive.extractfile(self.args.name + '/DLSSNR').read(), b'new')
+        self.assertEqual(self.checksum.read_text(),
+                         self.builder.digest(self.archive) + '  ' + self.archive.name + '\n')
+        self.assertEqual(set(self.output.iterdir()), {self.destination, self.archive, self.checksum})
+
+    def test_build_and_archive_failure_preserve_previous_package(self):
+        self.package(b'old')
+        before = self.snapshot()
+        for function in ['build', 'digest']:
+            with self.subTest(function=function), mock.patch.object(
+                    self.builder, 'build', side_effect=lambda args, repo, root: self.make_bundle(root, b'new')), mock.patch.object(
+                    self.builder, function, side_effect=RuntimeError('injected failure')):
+                with self.assertRaisesRegex(RuntimeError, 'injected failure'):
+                    self.builder.package(self.args, REPO)
+            self.assertEqual(self.snapshot(), before)
+            self.assertEqual(len(list(self.output.iterdir())), 3)
+
+    def test_each_publication_failure_restores_previous_package(self):
+        self.package(b'old')
+        before = self.snapshot()
+        rename = Path.rename
+        # Three backups followed by three replacements. Every individual move
+        # may fail (e.g. disk or permissions error); the previous set must survive.
+        for fail_at in range(1, 7):
+            moves = 0
+
+            def fail_one_move(source, target):
+                nonlocal moves
+                moves += 1
+                if moves == fail_at:
+                    raise OSError('injected publication failure')
+                return rename(source, target)
+
+            with self.subTest(fail_at=fail_at), mock.patch.object(Path, 'rename', fail_one_move):
+                with self.assertRaisesRegex(OSError, 'injected publication failure'):
+                    self.package()
+            self.assertEqual(self.snapshot(), before)
+            self.assertEqual(len(list(self.output.iterdir())), 3)
+
+    def test_interrupt_after_each_completed_move_restores_previous_package(self):
+        self.package(b'old')
+        before = self.snapshot()
+        rename = Path.rename
+        for interrupt_at in range(1, 7):
+            moves = 0
+
+            def interrupt_completed_move(source, target):
+                nonlocal moves
+                result = rename(source, target)
+                moves += 1
+                if moves == interrupt_at:
+                    raise KeyboardInterrupt('interrupted after completed move')
+                return result
+
+            with self.subTest(interrupt_at=interrupt_at), mock.patch.object(
+                    Path, 'rename', interrupt_completed_move):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.package()
+            self.assertEqual(self.snapshot(), before)
+            self.assertEqual(len(list(self.output.iterdir())), 3)
+
+    def test_interrupt_during_rollback_preserves_every_previous_output(self):
+        self.package(b'old')
+        old_archive = self.archive.read_bytes()
+        old_checksum = self.checksum.read_bytes()
+        rename = Path.rename
+        # Finish all six publication moves, interrupt, then interrupt again
+        # after each completed rollback move. Recovery may be partial, but no
+        # previous directory/archive/checksum may be discarded by cleanup.
+        for interrupt_at in range(7, 13):
+            moves = 0
+
+            def interrupt_publish_and_rollback(source, target):
+                nonlocal moves
+                result = rename(source, target)
+                moves += 1
+                if moves in (6, interrupt_at):
+                    raise KeyboardInterrupt('interrupted after completed move')
+                return result
+
+            with self.subTest(interrupt_at=interrupt_at), mock.patch.object(
+                    Path, 'rename', interrupt_publish_and_rollback):
+                with self.assertRaisesRegex(RuntimeError, 'recovery files kept'):
+                    self.package()
+            staging, = self.output.glob('.ubuntu-bundle-*')
+            previous = staging / '.previous'
+            for destination, expected in [(self.destination / 'DLSSNR', b'old'),
+                                          (self.archive, old_archive),
+                                          (self.checksum, old_checksum)]:
+                backup = previous / destination.relative_to(self.output)
+                self.assertTrue(any(path.is_file() and path.read_bytes() == expected
+                                    for path in [destination, backup]))
+            # Restore this fixture with real renames, ready for the next case.
+            for destination in [self.destination, self.archive, self.checksum]:
+                backup = previous / destination.name
+                if backup.exists():
+                    if destination.is_dir():
+                        shutil.rmtree(destination)
+                    elif destination.exists():
+                        destination.unlink()
+                    backup.rename(destination)
+            shutil.rmtree(staging)
+
+    def test_unknown_existing_outputs_are_rejected_before_build(self):
+        for shape in ['directory', 'wrong-target', 'incomplete', 'archive', 'checksum']:
+            with self.subTest(shape=shape):
+                if shape in ['directory', 'wrong-target', 'incomplete']:
+                    self.destination.mkdir()
+                    (self.destination / 'keep.txt').write_bytes(b'user file')
+                    if shape != 'directory':
+                        (self.destination / 'bundle-metadata.json').write_text(json.dumps({
+                            'target': 'other' if shape == 'wrong-target' else 'Ubuntu 22.04 x86_64'}))
+                else:
+                    (self.archive if shape == 'archive' else self.checksum).write_bytes(b'user file')
+                before = self.snapshot()
+                with mock.patch.object(self.builder, 'build') as build:
+                    with self.assertRaisesRegex(RuntimeError, 'unrecognized|Unrecognized'):
+                        self.builder.package(self.args, REPO)
+                    build.assert_not_called()
+                self.assertEqual(self.snapshot(), before)
+                for item in self.output.iterdir():
+                    shutil.rmtree(item) if item.is_dir() else item.unlink()
+
+    def test_failed_rollback_keeps_previous_package_for_recovery(self):
+        self.package(b'old')
+        old_archive = self.archive.read_bytes()
+        rename = Path.rename
+
+        def fail_publish_and_restore(source, target):
+            if source == self.archive or source.parent.name == '.previous':
+                raise OSError('filesystem unavailable')
+            return rename(source, target)
+
+        with mock.patch.object(Path, 'rename', fail_publish_and_restore):
+            with self.assertRaisesRegex(RuntimeError, 'recovery files kept'):
+                self.package()
+        staging, = self.output.glob('.ubuntu-bundle-*')
+        self.assertEqual((staging / '.previous' / self.args.name / 'DLSSNR').read_bytes(), b'old')
+        self.assertEqual(self.archive.read_bytes(), old_archive)
+
+    def test_symlink_outputs_and_metadata_are_rejected(self):
+        outside = self.base / 'outside'
+        outside.mkdir()
+        marker = outside / 'keep.txt'
+        marker.write_bytes(b'untouched')
+        self.package(b'old')
+        for target in [self.destination, self.archive, self.checksum,
+                       self.destination / 'bundle-metadata.json']:
+            with self.subTest(target=target.name):
+                backup = self.base / 'original'
+                target.rename(backup)
+                target.symlink_to(outside if backup.is_dir() else marker,
+                                  target_is_directory=backup.is_dir())
+                with mock.patch.object(self.builder, 'build') as build:
+                    with self.assertRaisesRegex(RuntimeError, 'symlink|unrecognized|Unrecognized'):
+                        self.builder.package(self.args, REPO)
+                    build.assert_not_called()
+                self.assertTrue(target.is_symlink())
+                self.assertEqual(marker.read_bytes(), b'untouched')
+                target.unlink()
+                backup.rename(target)
+
+    def test_unsafe_names_are_rejected_before_creating_files(self):
+        for name in ['', '.', '..', '../outside', '/outside', 'folder/name',
+                     'folder\\name', 'C:outside']:
+            with self.subTest(name=name):
+                self.args.name = name
+                with mock.patch.object(self.builder, 'build') as build:
+                    with self.assertRaisesRegex(RuntimeError, 'simple directory name'):
+                        self.builder.package(self.args, REPO)
+                    build.assert_not_called()
+                self.assertEqual(list(self.output.iterdir()), [])
 
 
 class ModelPackagingTests(unittest.TestCase):

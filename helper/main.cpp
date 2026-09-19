@@ -7,6 +7,7 @@
 #include "logging.h"
 #include "../common/shm_protocol.h"
 #include "mvec_deadzone_spv.h"
+#include "vulkan_features.h"
 
 #include <algorithm>
 #include <atomic>
@@ -402,22 +403,36 @@ static bool CreateContext(VkCtx& c) {
                            VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME })
         if (HasDeviceExt(c.physical, e)) enabled.push_back(e);
     c.sync2 = HasDeviceExt(c.physical, "VK_KHR_synchronization2");
-    VkPhysicalDeviceOpticalFlowFeaturesNV flowFeatures{};
-    flowFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV;
-    flowFeatures.opticalFlow = VK_TRUE;
-    VkPhysicalDeviceSynchronization2Features sync2Features{};
-    sync2Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
-    sync2Features.synchronization2 = VK_TRUE;
-    if (c.opticalFlow && c.sync2) flowFeatures.pNext = &sync2Features;
+    const auto queryFeatures = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+        g_gipa(c.instance, "vkGetPhysicalDeviceFeatures2"));
+    NeuralDeviceFeatures features;
+    if (!features.Query(c.physical, queryFeatures, c.sync2, c.opticalFlow)) {
+        Log("[vk] required bufferDeviceAddress unavailable (query=%p); cannot create neural device",
+            (void*)queryFeatures);
+        return false;
+    }
+    c.sync2 = features.sync.synchronization2;
+    c.opticalFlow = features.flow.opticalFlow;
+    Log("[vk] enabling features: bufferDeviceAddress=%u synchronization2=%u opticalFlow=%u",
+        features.address.bufferDeviceAddress, features.sync.synchronization2, features.flow.opticalFlow);
+    for (const char* extension : enabled) Log("[vk] enabled device extension: %s", extension);
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    if (c.opticalFlow) dci.pNext = &flowFeatures;
-    else if (c.sync2) dci.pNext = &sync2Features;
+    dci.pNext = &features.address;
     dci.queueCreateInfoCount = (uint32_t)qcis.size();
     dci.pQueueCreateInfos = qcis.data();
     dci.enabledExtensionCount = (uint32_t)enabled.size();
     dci.ppEnabledExtensionNames = enabled.data();
-    if (vkCreateDevice(c.physical, &dci, nullptr, &c.device) != VK_SUCCESS) { Log("[helper] vkCreateDevice failed"); return false; }
+    const VkResult deviceResult = vkCreateDevice(c.physical, &dci, nullptr, &c.device);
+    Log("[vk] vkCreateDevice -> %d", int(deviceResult));
+    if (deviceResult != VK_SUCCESS) return false;
+    auto getDeviceProc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+        g_gipa(c.instance, "vkGetDeviceProcAddr"));
+    for (const char* entry : { "vkGetBufferDeviceAddress", "vkGetBufferDeviceAddressKHR",
+                              "vkCreateCuModuleNVX", "vkCreateCuFunctionNVX",
+                              "vkGetImageViewHandleNVX", "vkGetImageViewHandle64NVX" })
+        Log("[vk] device entry %s=%p", entry,
+            getDeviceProc ? (void*)getDeviceProc(c.device, entry) : nullptr);
     vkGetDeviceQueue(c.device, c.queueFamily, 0, &c.queue);
     if (c.opticalFlow && c.opticalQueueFamily != UINT32_MAX)
         vkGetDeviceQueue(c.device, c.opticalQueueFamily, 0, &c.opticalQueue);
@@ -2850,6 +2865,9 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     const double tDone = time ? NowMs() : 0.0;
 
     ++ns.evaluates;
+    if (ns.evaluates == 1)
+        Log("[helper] STATUS: neural frame completed count=1 size=%ux%u passes=%u; output ready for layer",
+            w, h, ns.livePasses);
     if (shm.hdr) {
         ShmStore64(shm.hdr->helperFramesLo, shm.hdr->helperFramesHi, ns.evaluates);
         shm.hdr->helperEvalMsBits.store(FloatToBits(float(tEval - tUpload)));
@@ -2985,8 +3003,10 @@ int main() {
         }
     }
 
-    if (shm.hdr->quit.load()) Log("[helper] quit requested");
-    else if (ns.ngx.disabled) Log("[helper] neural disabled");
+    if (ns.ngx.disabled) Log("[helper] stopped: neural failure (helper requested quit)");
+    else if (shm.hdr->quit.load()) Log("[helper] quit requested externally");
+    Log("[helper] session result: completedFrames=%llu modelDisabled=%d",
+        (unsigned long long)ns.evaluates, int(ns.ngx.disabled));
     shm.hdr->helperState.store(kHelperStopped);
     Log("[helper] shutting down");
     if (ns.ngx.snippet) NgxTeardown(ns.ngx, ns.vk.device);

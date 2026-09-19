@@ -181,7 +181,16 @@ enum NVSDK_NGX_DLSS_Feature_Flags {
 typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkInitExt)(
     unsigned long long InApplicationId, const wchar_t* InApplicationDataPath,
     VkInstance InInstance, VkPhysicalDevice InPD, VkDevice InDevice,
-    NVSDK_NGX_Version InSDKVersion, const NVSDK_NGX_FeatureDiscoveryInfo* InFeatureInfo);
+    NVSDK_NGX_Version InSDKVersion, const NVSDK_NGX_Parameter* InParameters);
+// NGX_SNIPPET_BUILD declarations differ from the SDK/core entry points.
+// https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx_vk.h
+typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkInitExt2)(
+    unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice,
+    PFN_vkGetInstanceProcAddr, PFN_vkGetDeviceProcAddr, NVSDK_NGX_Version,
+    const NVSDK_NGX_Parameter*);
+typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkInit)(
+    unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice,
+    NVSDK_NGX_Version);
 typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkCreateFeature)(
     VkCommandBuffer InCmdList, int feature, NVSDK_NGX_Parameter* parameters,
     NVSDK_NGX_Handle** handle);

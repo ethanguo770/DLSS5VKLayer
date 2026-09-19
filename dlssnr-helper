@@ -631,6 +631,29 @@ running_pid() {
   return 0
 }
 
+log_launch_context() {
+  local helper="$1" runner="$2" key digest
+  {
+    printf '\n[dlssnr-launch] === session %s ===\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf '[dlssnr-launch] runner=%s path=%s\n' "$runner_type" "$runner"
+    printf '[dlssnr-launch] helper=%s\n' "$helper"
+    if command -v sha256sum >/dev/null 2>&1; then
+      digest="$(sha256sum -- "$helper" 2>/dev/null)"
+      [ -z "$digest" ] || printf '[dlssnr-launch] helper sha256=%s\n' "${digest%% *}"
+    fi
+    printf '[dlssnr-launch] prefix=%s modelRoot=%s\n' "$WINE_PREFIX_DIR" "$binaries"
+    # Only selected runtime controls, never a dump of the user's environment.
+    for key in WINEDEBUG WINEDLLOVERRIDES DXVK_NVAPI_LOG_LEVEL DXVK_NVAPI_LOG_PATH \
+               DXVK_NVAPI_GPU_ARCH DXVK_NVAPI_DRIVER_VERSION DXVK_NVAPI_DISABLE_ENTRYPOINTS \
+               DXVK_NVAPI_ALLOW_OTHER_DRIVERS DXVK_FILTER_DEVICE_NAME VKD3D_FILTER_DEVICE_NAME \
+               __NGX_ENABLE_OVERRIDE_LOG_PATH __NGX_LOG_PATH_OVERRIDE __NGX_LOG_LEVEL; do
+      if [ "${!key+x}" = x ]; then
+        printf '[dlssnr-launch] %s=%s\n' "$key" "${!key}"
+      fi
+    done
+  } >> "$log"
+}
+
 cmd_start() {
   ensure_dirs
   if [ ! -f "$CONFIG_FILE" ]; then
@@ -712,7 +735,20 @@ cmd_start() {
   export DLSSNR_UID="$UID"
   export DLSSNR_LOG="$log"
   export DXVK_CONFIG_FILE="$DXVK_CONFIG_FILE"
-  export WINEDEBUG="${WINEDEBUG:--all}"
+  export WINEDEBUG="${WINEDEBUG--all}"
+  # DXVK-NVAPI 0.9.2 defaults to no output. Its info level records initialization,
+  # unsupported entry points and errors without tracing every frame. Console
+  # output already lands in helper.log; keep its optional extra file sink opt-in.
+  export DXVK_NVAPI_LOG_LEVEL="${DXVK_NVAPI_LOG_LEVEL-info}"
+  # This model DLL's own logger uses a Windows directory and version-based file
+  # names. Reuse one location so failures can be summarized back into helper.log.
+  # Preserve explicit overrides, including disabling the logger with 0.
+  export __NGX_ENABLE_OVERRIDE_LOG_PATH="${__NGX_ENABLE_OVERRIDE_LOG_PATH-1}"
+  if [ "${__NGX_LOG_PATH_OVERRIDE+x}" != x ]; then
+    mkdir -p "$STATE_DIR/ngx"
+    export __NGX_LOG_PATH_OVERRIDE="Z:$STATE_DIR/ngx"
+  fi
+  export __NGX_LOG_LEVEL="${__NGX_LOG_LEVEL-2}"
   if [ -n "$binaries" ]; then
     export DLSSNR_BIN_DIR="Z:$binaries"
   fi
@@ -747,6 +783,7 @@ cmd_start() {
     return 1
   fi
 
+  log_launch_context "$helper" "$runner"
   setsid bash -c '
     printf "%s\n" "$$" > "$1"
     shift

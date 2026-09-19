@@ -41,6 +41,14 @@ tools/meson-build.sh test
 python3 packaging/make-ubuntu-bundle.py
 ```
 
+The output name stays fixed at `dist/dlssnr-ubuntu22.04-x86_64.tar.gz`, with
+its extracted directory and SHA256 file beside it. Repeating the build replaces
+the previous package only after the new package is complete. A failed build
+keeps the last working package. Do not add commit IDs or dates to routine builds.
+For the personal dual-model build, keep one model input folder at `build/models`
+and pass `--binaries build/models`. Reuse `build/package.log` and
+`build/verification.log` for the latest build and checks.
+
 The bundle builder downloads and verifies pinned runtime archives and copies
 runtime libraries from the build host. It fails on missing libraries or invalid
 hashes. Optional `--binaries /path/to/dlls` includes an existing model directory;
@@ -371,6 +379,21 @@ Fallback:
 ```text
 ~/.local/state/dlssnr/helper.log
 ```
+
+The portable launcher records a timestamp and helper SHA256 for each run in the
+same log. NVAPI initialization/error logging is enabled automatically. NGX's
+internal logs use the fixed `~/.local/state/dlssnr/ngx/` directory (or the XDG
+state equivalent); recent bounded tails are copied into `helper.log` as
+`[ngx-log]` when model creation fails. Explicit logging environment overrides
+are preserved. These internal logging controls were checked against the bundled
+310.8 DLLs; a different imported DLL may not implement them.
+
+`[vk] enabling features: bufferDeviceAddress=1` confirms the Vulkan device enables
+the address feature used by the model. `Feature=18 created=true` means feature
+creation succeeded; `STATUS: neural frame completed count=1` confirms processing
+and output completion in the helper. The layer must still present that output
+for it to appear in the game. A `PlatformError` or `completedFrames=0` does not
+confirm an effect, even if the helper and DLL loaded successfully.
 
 ## Building From Source
 

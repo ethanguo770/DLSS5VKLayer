@@ -2,6 +2,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <string>
 
 // Define the public discovery ABI independently from the production declarations.
 // Reference: NVIDIA/DLSS include/nvsdk_ngx_defs.h and include/nvsdk_ngx_vk.h.
@@ -34,11 +36,37 @@ EXPORT unsigned int DlssnrTestInitCount() { return initializations; }
 EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_Init_Ext(
     unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice,
     NVSDK_NGX_Version, const void*) {
+    if (Mode("init-ext2") || Mode("init-plain")) return NVSDK_NGX_Result_FAIL_NotImplemented;
     ++initializations;
     // Keep the same import that the real snippet's caller hook requires.
     wchar_t caller[MAX_PATH]{};
     if (!GetModuleFileNameW(GetModuleHandleW(nullptr), caller, MAX_PATH))
         return NVSDK_NGX_Result_FAIL_PlatformError;
+    return NVSDK_NGX_Result_Success;
+}
+
+// Independently spell out the SDK's NGX_SNIPPET_BUILD signatures. These modes
+// fail the primary path so the production fallback really crosses the ABI.
+EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_Init_Ext2(
+    unsigned long long app, const wchar_t* path, VkInstance instance, VkPhysicalDevice pd,
+    VkDevice device, PFN_vkGetInstanceProcAddr gipa, PFN_vkGetDeviceProcAddr gdpa,
+    unsigned int version, const NVSDK_NGX_Parameter* parameters) {
+    if (Mode("init-plain")) return NVSDK_NGX_Result_FAIL_NotImplemented;
+    if (app != 0x0876232cULL || !path || instance != (VkInstance)0x1110 ||
+        pd != (VkPhysicalDevice)0x2220 || device != (VkDevice)0x3330 ||
+        gipa || gdpa || version != 0x14 || parameters)
+        return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    ++initializations;
+    return NVSDK_NGX_Result_Success;
+}
+
+EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_Init(
+    unsigned long long app, const wchar_t* path, VkInstance instance, VkPhysicalDevice pd,
+    VkDevice device, unsigned int version) {
+    if (app != 0x0876232cULL || !path || instance != (VkInstance)0x1110 ||
+        pd != (VkPhysicalDevice)0x2220 || device != (VkDevice)0x3330 || version != 0x14)
+        return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    ++initializations;
     return NVSDK_NGX_Result_Success;
 }
 
@@ -82,7 +110,17 @@ EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_CreateFeature(
     params->Get("Height", &height);
     if (Mode("resize") && creations == 2 && (width != 1280 || height != 720))
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
-    if (Mode("create-error")) return NVSDK_NGX_Result_FAIL_PlatformError;
+    if (Mode("create-error")) {
+        if (const char* path = std::getenv("__NGX_LOG_PATH_OVERRIDE")) {
+            FILE* log = fopen((std::string(path) + "/nvngx_mock_310_8_0.log").c_str(), "w");
+            if (log) {
+                for (int i = 0; i < 1000; ++i) fprintf(log, "old diagnostic line %d\n", i);
+                fprintf(log, "%s\nmock vendor cause: cubin creation failed -3\n", std::string(6000, 'X').c_str());
+                fclose(log);
+            }
+        }
+        return NVSDK_NGX_Result_FAIL_PlatformError;
+    }
     if (Mode("create-exception")) {
         RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
         return NVSDK_NGX_Result_FAIL_SEH;
@@ -106,5 +144,14 @@ EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_ReleaseFeature(NVSDK_NGX_Handle*) {
     return NVSDK_NGX_Result_Success;
 }
 EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_Shutdown1(VkDevice) {
+    if (Mode("create-exception")) {
+        if (const char* path = std::getenv("__NGX_LOG_PATH_OVERRIDE")) {
+            FILE* log = fopen((std::string(path) + "/nvngx_mock_310_8_0.log").c_str(), "w");
+            if (log) {
+                fputs("mock vendor diagnostic flushed at shutdown\n", log);
+                fclose(log);
+            }
+        }
+    }
     return NVSDK_NGX_Result_Success;
 }

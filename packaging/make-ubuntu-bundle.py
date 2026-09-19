@@ -280,6 +280,99 @@ def build(args, repo, root):
     (root / 'bundle-metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
 
 
+def bundle_outputs(output, name):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', name):
+        raise RuntimeError('--name must be a simple directory name')
+    return [output / name, output / (name + '.tar.gz'),
+            output / (name + '.tar.gz.sha256')]
+
+
+def check_previous_bundle(paths):
+    root, archive, checksum = paths
+    for path in paths:
+        if path.is_symlink():
+            raise RuntimeError('Refusing to replace symlink output: ' + str(path))
+    if not any(path.exists() for path in paths):
+        return
+    metadata = root / 'bundle-metadata.json'
+    try:
+        if not root.is_dir() or metadata.is_symlink() or not metadata.is_file():
+            raise ValueError('not an owned bundle directory')
+        record = json.loads(metadata.read_text())
+        if (not isinstance(record, dict) or record.get('target') != 'Ubuntu 22.04 x86_64'
+                or not isinstance(record.get('wine_version'), str)
+                or not isinstance(record.get('runtime_dll_pins'), dict)
+                or not all((root / relative).is_file() for relative in
+                           ['DLSSNR', 'helper/dlssnr_helper.exe', 'layer/libVkLayer_NV_dlssnr.so'])):
+            raise ValueError('missing bundle metadata or core files')
+        if any(path.exists() and not path.is_file() for path in [archive, checksum]):
+            raise ValueError('archive or checksum is not a regular file')
+    except (OSError, ValueError) as error:
+        raise RuntimeError('Unrecognized existing bundle; refusing to replace: ' + str(root)) from error
+
+
+def package(args, repo):
+    """Publish a complete set, restoring the previous set if any move fails."""
+    output = args.output_dir.resolve()
+    destinations = bundle_outputs(output, args.name)
+    check_previous_bundle(destinations)
+    output.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix='.ubuntu-bundle-', dir=output))
+    preserve_staging = False
+    try:
+        sources = bundle_outputs(staging, args.name)
+        root, archive, checksum_file = sources
+        root.mkdir()
+        build(args, repo, root)
+        print('Creating runtime archive', flush=True)
+        with tarfile.open(archive, 'w:gz', compresslevel=6) as stream:
+            stream.add(root, arcname=args.name)
+        checksum = digest(archive)
+        checksum_file.write_text(checksum + '  ' + archive.name + '\n')
+        # Recheck after the long build, before moving any existing output.
+        check_previous_bundle(destinations)
+        previous = staging / '.previous'
+        previous.mkdir()
+        backed_up, installed = [], []
+        # A signal can arrive after rename succeeded but before Python resumes.
+        # Journal the intended move first; retain recovery files until publishing
+        # or rollback has completed, including interruptions during rollback.
+        preserve_staging = True
+        try:
+            for destination in destinations:
+                if destination.exists():
+                    backup = previous / destination.name
+                    backed_up.append((backup, destination))
+                    destination.rename(backup)
+            for source, destination in zip(sources, destinations):
+                installed.append((destination, source))
+                source.rename(destination)
+        except BaseException:
+            try:
+                for destination, source in reversed(installed):
+                    if destination.exists():
+                        destination.rename(source)
+                for backup, destination in reversed(backed_up):
+                    if backup.exists():
+                        backup.rename(destination)
+            except BaseException as error:
+                # Never delete the previous package if even rollback is blocked
+                # by a filesystem error. Tell the caller where recovery files are.
+                preserve_staging = True
+                raise RuntimeError('Could not restore previous outputs; recovery files kept in '
+                                   + str(staging)) from error
+            preserve_staging = False
+            raise
+        preserve_staging = False
+        return destinations[1], checksum
+    finally:
+        if not preserve_staging:
+            # Delete only our direct temporary child, never a resolved external path.
+            if staging.is_symlink() or staging.resolve().parent != output:
+                raise RuntimeError('Refusing to clean unexpected staging path: ' + str(staging))
+            shutil.rmtree(staging)
+
+
 def main():
     repo = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
@@ -306,26 +399,10 @@ def main():
     args.cache_dir = args.cache_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
-    destination = args.output_dir / args.name
-    archive = args.output_dir / (args.name + '.tar.gz')
-    if destination.exists() or archive.exists():
-        parser.error('Output already exists; choose a new --name or --output-dir.')
     try:
-        with tempfile.TemporaryDirectory(prefix='.ubuntu-bundle-', dir=args.output_dir) as temporary:
-            root = Path(temporary) / args.name
-            root.mkdir()
-            build(args, repo, root)
-            temporary_archive = Path(temporary) / (args.name + '.tar.gz')
-            print('Creating runtime archive', flush=True)
-            with tarfile.open(temporary_archive, 'w:gz', compresslevel=6) as output:
-                output.add(root, arcname=args.name)
-            root.rename(destination)
-            temporary_archive.rename(archive)
+        archive, checksum = package(args, repo)
         print('Built ' + str(archive), flush=True)
-        print('Extracted directory: ' + str(destination), flush=True)
-        checksum = digest(archive)
-        archive.with_suffix(archive.suffix + '.sha256').write_text(
-            checksum + '  ' + archive.name + '\n')
+        print('Extracted directory: ' + str(args.output_dir / args.name), flush=True)
         print('SHA256: ' + checksum, flush=True)
     except (OSError, RuntimeError, tarfile.TarError, KeyError) as error:
         print('Bundle build failed: ' + str(error), file=sys.stderr)

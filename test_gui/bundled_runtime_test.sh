@@ -50,4 +50,48 @@ touch "$DLSSNR_INSTALL_DIR/helper/dlssnr_helper.exe" \
 diagnostics="$(bash "$repo/dlssnr-helper" doctor)"
 [[ "$diagnostics" == *"$DLSSNR_INSTALL_DIR/runtime-dlls/dxgi.dll"* ]]
 [[ "$diagnostics" == *"$DLSSNR_INSTALL_DIR/runtime-dlls/nvapi64.dll"* ]]
+
+# Exercise the actual launch boundary without Wine or a GPU. The runner leaves
+# its environment in the existing helper log, then stays visible to status.
+cat > "$DLSSNR_BUNDLED_RUNNER" <<'EOF'
+#!/usr/bin/env bash
+printf '[fixture] nvapi=<%s> wine=<%s> arch=<%s> extraLog=<%s>\n' \
+  "$DXVK_NVAPI_LOG_LEVEL" "$WINEDEBUG" "${DXVK_NVAPI_GPU_ARCH-}" "${DXVK_NVAPI_LOG_PATH-}"
+printf '[fixture] ngxEnable=<%s> ngxLevel=<%s> ngxPath=<%s>\n' \
+  "$__NGX_ENABLE_OVERRIDE_LOG_PATH" "$__NGX_LOG_LEVEL" "$__NGX_LOG_PATH_OVERRIDE"
+exec -a dlssnr_helper.exe sleep 60
+EOF
+stop_fixture() {
+  local pidfile="/tmp/dlssnr-$DLSSNR_UID/helper.pid" pid
+  if [ -f "$pidfile" ]; then
+    pid="$(cat "$pidfile")"
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    rm -f "$pidfile"
+  fi
+}
+trap 'stop_fixture; rm -rf "$work" "/tmp/dlssnr-$DLSSNR_UID"' EXIT
+helper_log="$XDG_STATE_HOME/dlssnr/helper.log"
+unset DXVK_NVAPI_LOG_LEVEL DXVK_NVAPI_LOG_PATH WINEDEBUG DXVK_NVAPI_GPU_ARCH
+unset __NGX_ENABLE_OVERRIDE_LOG_PATH __NGX_LOG_PATH_OVERRIDE __NGX_LOG_LEVEL
+start_output="$(bash "$repo/dlssnr-helper" start)"
+[[ "$start_output" == *'helper started'* ]]
+grep -Fq '[fixture] nvapi=<info> wine=<-all> arch=<> extraLog=<>' "$helper_log"
+grep -Fq '[dlssnr-launch] === session ' "$helper_log"
+grep -Fq '[dlssnr-launch] helper sha256=' "$helper_log"
+grep -Fq "[fixture] ngxEnable=<1> ngxLevel=<2> ngxPath=<Z:$XDG_STATE_HOME/dlssnr/ngx>" "$helper_log"
+[[ -d "$XDG_STATE_HOME/dlssnr/ngx" ]]
+stop_fixture
+
+# Explicit none/empty settings remain user-owned. The second start reuses the
+# same log and records both the changed diagnostic level and GPU override.
+export DXVK_NVAPI_LOG_LEVEL=none WINEDEBUG='' DXVK_NVAPI_GPU_ARCH=AD100
+export __NGX_ENABLE_OVERRIDE_LOG_PATH=0 __NGX_LOG_LEVEL=0 __NGX_LOG_PATH_OVERRIDE='C:/my diagnostics'
+start_output="$(bash "$repo/dlssnr-helper" start)"
+[[ "$start_output" == *'helper started'* ]]
+grep -Fq '[fixture] nvapi=<none> wine=<> arch=<AD100> extraLog=<>' "$helper_log"
+grep -Fq '[dlssnr-launch] DXVK_NVAPI_GPU_ARCH=AD100' "$helper_log"
+grep -Fq '[fixture] ngxEnable=<0> ngxLevel=<0> ngxPath=<C:/my diagnostics>' "$helper_log"
+[[ "$(grep -Fc '[dlssnr-launch] === session ' "$helper_log")" == 2 ]]
+[[ ! -e "$XDG_STATE_HOME/dlssnr/nvapi64.log" ]]
+stop_fixture
 printf 'Bundled runtime defaults: passed\n'

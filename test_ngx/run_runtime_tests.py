@@ -16,7 +16,7 @@ CASES = ['runtime', 'bundled', 'query-error', 'create-error', 'create-exception'
          'evaluate-exception', 'hdr-fallback', 'resize', 'query-unsupported',
          'query-adapter-unsupported', 'profile-rtx40', 'profile-rtx40-laptop',
          'profile-rtx40-resize', 'profile-rtx50', 'profile-flat40',
-         'profile-workstation', 'profile-other-vendor', 'profile-unknown']
+         'profile-workstation', 'profile-other-vendor', 'profile-unknown', 'init-ext2', 'init-plain']
 
 
 def main():
@@ -86,6 +86,13 @@ def main():
                     destination = runtime
                 shutil.copy2(build / 'ngx_mock_nvapi.dll', destination)
                 log = work / 'helper.log'
+                internal = work / 'ngx'
+                internal.mkdir()
+                stale = internal / 'nvngx_stale.log'
+                stale.write_text('stale vendor failure must not be copied')
+                os.utime(stale, (1, 1))
+                (internal / 'unrelated.log').write_text('unrelated log must not be copied')
+                env['__NGX_LOG_PATH_OVERRIDE'] = windows_path(internal)
                 command = ([wine] if wine else []) + [str(work / 'ngx_runtime_test.exe'),
                     windows_path(model), windows_path(log), case]
                 result = subprocess.run(command, cwd=work, env=env, timeout=30,
@@ -103,6 +110,17 @@ def main():
                 assert '[model] version=310.8.42.0' in output, output
                 assert '[model] fileVersion=310.8.mock.0' in output, output
                 assert 'size=' in output and 'modifiedFileTime=' in output, output
+                assert 'stale vendor failure' not in output and 'unrelated log' not in output, output
+                if case == 'create-error':
+                    assert '[ngx-log] mock vendor cause: cubin creation failed -3' in output, output
+                    assert '[ngx-log] old diagnostic line 0\n' not in output, output
+                    assert len(output) < 32000, len(output)
+                if case == 'create-exception':
+                    assert '[ngx-log] mock vendor diagnostic flushed at shutdown' in output, output
+                if case == 'init-ext2':
+                    assert 'VULKAN_Init_Ext2(ver=0x14) -> 0x1 (Success)' in output, output
+                if case == 'init-plain':
+                    assert 'VULKAN_Init(ver=0x14) -> 0x1 (Success)' in output, output
                 loaded_path = windows_path(selected_model).replace('/', '\\').lower()
                 assert ('path=' + loaded_path + '\\nvngx_dlssnr.dll') in output.replace('/', '\\').lower(), output
                 if case.startswith('profile-rtx40'):

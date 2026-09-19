@@ -25,6 +25,12 @@ version resource verifies both numeric and string DLL version diagnostics;
 capability tests verify rejection-bit names and unknown bits without treating
 a successful query as proof of support.
 
+Fallback cases exercise independently declared snippet Init_Ext2 and Init ABIs.
+Device-feature checks cover the buffer-address enable bit, optional feature
+chains, and unsupported queries. A failing mock writes a long internal NGX log
+to verify bounded tail capture, termination of long messages, and exclusion of
+stale/unrelated files. These checks do not validate real driver shader execution.
+
 The mock DLLs and test executable are build outputs only. The runtime packager
 copies named production files and must never include them. Per-case logs are
 written to the Windows build directory.

@@ -16,8 +16,8 @@ struct NgxSnippet {
     HMODULE nvapi = nullptr;
 
     FnVkInitExt initExt = nullptr;
-    FnVkInitExt initExt2 = nullptr;
-    FnVkInitExt initPlain = nullptr;
+    FnVkInitExt2 initExt2 = nullptr;
+    FnVkInit initPlain = nullptr;
     FnVkCreateFeature createFeature = nullptr;
     FnVkEvaluateFeature evaluateFeature = nullptr;
     FnVkReleaseFeature releaseFeature = nullptr;
@@ -60,6 +60,8 @@ struct NgxSnippet {
     // Captured from the physical device used by the helper, before first init.
     // The model directory is then held for the entire NGX context lifetime.
     VkPhysicalDeviceProperties deviceProperties{};
+    FILETIME diagnosticStart{};
+    bool diagnosticCopied = false;
 };
 
 // Layer module handle (set in DllMain), used as the spoofed caller identity.

@@ -15,17 +15,18 @@ inline bool Verbose() {
 
 inline void Log(const char* fmt, ...) {
     static FILE* f = [] {
-        char path[MAX_PATH];
-        if (GetEnvironmentVariableA("DLSSNR_LOG", path, MAX_PATH) == 0) return (FILE*)nullptr;
+        char path[MAX_PATH]{};
+        const DWORD length = GetEnvironmentVariableA("DLSSNR_LOG", path, MAX_PATH);
+        if (!length || length >= MAX_PATH) return (FILE*)nullptr;
         return fopen(path, "a");
     }();
     char buf[2048];
     va_list args;
     va_start(args, fmt);
-    _vsnprintf(buf, sizeof(buf), fmt, args);
+    vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
     char line[2200];
-    _snprintf(line, sizeof(line), "[dlssnr] %s\r\n", buf);
+    snprintf(line, sizeof(line), "[dlssnr] %s\r\n", buf);
     OutputDebugStringA(line);
     if (f) { fputs(line, f); fflush(f); }
 }

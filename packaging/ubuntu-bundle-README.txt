@@ -12,6 +12,18 @@ RTX 50 系使用 SF-v2。无需手动切换。日志会记录选择结果和 DLL
 更换包前先停止旧 helper。手动导入的模型目录仍优先；详细来源、哈希和
 兼容性验证范围见 MODEL_PROFILES.md。自动选择不等于已验证实际画面效果。
 
+后续更新使用固定的 dlssnr-ubuntu22.04-x86_64 文件夹和同名压缩包，
+不再按版本号新增文件夹。构建成功后替换旧包，构建失败时保留旧包。
+
+本版自动记录 NVAPI 与模型内部日志，无需另加启动参数。
+主日志：~/.local/state/dlssnr/helper.log；模型原始日志：同目录下的 ngx/。
+如果配置过 XDG_STATE_HOME，日志位于该目录下的 dlssnr/。
+创建失败时，主日志中的 [ngx-log] 会摘取本次更新的模型日志末尾。
+每次启动带时间和 helper 文件 SHA256，便于区分新旧测试。
+“Feature=18 created=true”表示模型创建成功；进一步出现
+“STATUS: neural frame completed count=1”才表示 helper 实际处理完成一帧。
+实际显示还需游戏层接收并呈现该结果。
+
 Qt、Wine、DXVK 和 NVAPI 已随包提供，无需自行安装。若包内已有模型 DLL，
 界面会自动识别，无需导入。Check setup 用于检查，Details 显示准备进度和错误。
 显卡驱动由系统提供：需要支持 Vulkan 1.4 的 NVIDIA 驱动，版本 575.51.02

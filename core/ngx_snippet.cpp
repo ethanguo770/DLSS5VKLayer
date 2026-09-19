@@ -368,8 +368,8 @@ static bool LoadModulesAndParameters(NgxSnippet& s, VkInstance instance,
     RegisterPeRange("nvngx_dlssnr.dll", s.snippet);
 
     s.initExt = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init_Ext"));
-    s.initExt2 = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init_Ext2"));
-    s.initPlain = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init"));
+    s.initExt2 = reinterpret_cast<FnVkInitExt2>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init_Ext2"));
+    s.initPlain = reinterpret_cast<FnVkInit>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init"));
     s.createFeature = reinterpret_cast<FnVkCreateFeature>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_CreateFeature"));
     s.evaluateFeature = reinterpret_cast<FnVkEvaluateFeature>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_EvaluateFeature"));
     s.releaseFeature = reinterpret_cast<FnVkReleaseFeature>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_ReleaseFeature"));
@@ -425,7 +425,8 @@ static bool LoadModulesAndParameters(NgxSnippet& s, VkInstance instance,
         const char* projectId = "7c134ab9-9677-4af5-a2b2-bca943350861";
         typedef NVSDK_NGX_Result (NVSDK_CONV* FnCoreInitWithProjectID)(
             const char*, int, const char*, const wchar_t*,
-            VkInstance, VkPhysicalDevice, VkDevice);
+            VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr,
+            PFN_vkGetDeviceProcAddr, const NVSDK_NGX_FeatureCommonInfo*, NVSDK_NGX_Version);
         typedef NVSDK_NGX_Result (NVSDK_CONV* FnCoreInitExt)(
             unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice,
             NVSDK_NGX_Version, const NVSDK_NGX_FeatureDiscoveryInfo*);
@@ -441,7 +442,8 @@ static bool LoadModulesAndParameters(NgxSnippet& s, VkInstance instance,
             DWORD seh2 = 0;
             NVSDK_NGX_Result r = Guarded([&] {
                 return coreInitProjectID(projectId, 3 /*CUSTOM*/, "Magpie-Experimental-0.5.7",
-                    s.binDir.c_str(), instance, pd, device);
+                    s.binDir.c_str(), instance, pd, device, nullptr, nullptr, nullptr,
+                    NVSDK_NGX_Version_API_14);
             }, NVSDK_NGX_Result_FAIL_SEH, &seh2);
             Log("[core] VULKAN_Init_with_ProjectID -> %#x seh=%#x", (uint32_t)r, seh2);
             coreInited = NVSDK_NGX_SUCCEED(r);
@@ -514,6 +516,7 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
                     const NgxTuning& tuning) {
     if (s.disabled) return false;
     if (!s.initialized) {
+        GetSystemTimeAsFileTime(&s.diagnosticStart);
         if (!LoadModulesAndParameters(s, instance, pd, device)) return false;
     } else {
         // Resize and HDR fallback enter here after the caller has finished GPU
@@ -576,7 +579,7 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         ps ? "ok" : "FAILED", seh, createFlags, int(wantHdr));
 
     if (!s.initialized) {
-        // Snippet Init_Ext: (appId, path, instance, pd, device, version, featureInfo=nullptr)
+        // The optional snippet parameter block is distinct from FeatureCommonInfo.
         NVSDK_NGX_Result initResult = NVSDK_NGX_Result_FAIL_NotInitialized;
         NVSDK_NGX_Version initializedVersion = 0;
         for (NVSDK_NGX_Version ver : { NVSDK_NGX_Version_API_14, NVSDK_NGX_Version_API_13 }) {
@@ -588,15 +591,19 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
                 if (NVSDK_NGX_SUCCEED(initResult)) { initializedVersion = ver; break; }
             }
             if (!NVSDK_NGX_SUCCEED(initResult) && s.initExt2) {
-                initResult = CallInitExtSafely(s.initExt2, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
-                    s.binDir.c_str(), instance, pd, device, ver, &seh);
+                initResult = Guarded([&] {
+                    return s.initExt2(DLSSNR_SIGNED_SNIPPET_APPLICATION_ID, s.binDir.c_str(),
+                        instance, pd, device, nullptr, nullptr, ver, nullptr);
+                }, NVSDK_NGX_Result_FAIL_SEH, &seh);
                 Log("[ngx] VULKAN_Init_Ext2(ver=0x%x) -> %#x (%s) seh=%#x",
                     ver, (uint32_t)initResult, NgxResultName(initResult), seh);
                 if (NVSDK_NGX_SUCCEED(initResult)) { initializedVersion = ver; break; }
             }
             if (!NVSDK_NGX_SUCCEED(initResult) && s.initPlain) {
-                initResult = CallInitExtSafely(s.initPlain, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
-                    s.binDir.c_str(), instance, pd, device, ver, &seh);
+                initResult = Guarded([&] {
+                    return s.initPlain(DLSSNR_SIGNED_SNIPPET_APPLICATION_ID, s.binDir.c_str(),
+                        instance, pd, device, ver);
+                }, NVSDK_NGX_Result_FAIL_SEH, &seh);
                 Log("[ngx] VULKAN_Init(ver=0x%x) -> %#x (%s) seh=%#x",
                     ver, (uint32_t)initResult, NgxResultName(initResult), seh);
                 if (NVSDK_NGX_SUCCEED(initResult)) { initializedVersion = ver; break; }
@@ -723,6 +730,68 @@ static void ApplyHdrContract(NgxSnippet& s) {
     ParamSetUI(s.params, "DLSSNR.SDR", s.hdrActive ? 0u : 1u, &seh);
 }
 
+// Read only bounded tails from NGX's own log names, changed during this context.
+// The vendor owns the files and may buffer output; absence is not proof of a
+// successful internal call. Original files remain available in the fixed folder.
+static void LogModelDiagnostics(NgxSnippet& s) {
+    wchar_t directory[1024]{};
+    const DWORD length = GetEnvironmentVariableW(L"__NGX_LOG_PATH_OVERRIDE", directory, 1024);
+    if (!length || length >= 1024) {
+        Log("[ngx-log] internal log directory unavailable");
+        return;
+    }
+    WIN32_FIND_DATAW found{};
+    const std::wstring root = std::wstring(directory) + L"\\";
+    HANDLE search = FindFirstFileW((root + L"nvngx_*.log").c_str(), &found);
+    unsigned copied = 0;
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            if (found.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+            if (CompareFileTime(&found.ftLastWriteTime, &s.diagnosticStart) < 0) continue;
+            HANDLE file = CreateFileW((root + found.cFileName).c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file == INVALID_HANDLE_VALUE) continue;
+            LARGE_INTEGER size{}, start{};
+            char tail[16385]{};
+            DWORD bytes = 0;
+            bool read = GetFileSizeEx(file, &size);
+            start.QuadPart = size.QuadPart > 16384 ? size.QuadPart - 16384 : 0;
+            read = read && SetFilePointerEx(file, start, nullptr, FILE_BEGIN) &&
+                   ReadFile(file, tail, sizeof(tail) - 1, &bytes, nullptr);
+            CloseHandle(file);
+            if (!read || !bytes) continue;
+            ++copied;
+            Log("[ngx-log] file=%ls (last %lu bytes; vendor timestamps identify the run)",
+                found.cFileName, bytes);
+            char* cursor = tail;
+            if (start.QuadPart > 0) {
+                char* newline = std::strchr(cursor, '\n');
+                if (newline) cursor = newline + 1;
+            }
+            // At most 128 messages per file, retaining the end of a noisy tail.
+            unsigned lines = 0;
+            for (char* p = cursor; *p; ++p) if (*p == '\n') ++lines;
+            while (lines > 128) {
+                cursor = std::strchr(cursor, '\n') + 1;
+                --lines;
+            }
+            while (*cursor) {
+                char* end = std::strchr(cursor, '\n');
+                if (end) *end = '\0';
+                const size_t count = std::strlen(cursor);
+                if (count && cursor[count - 1] == '\r') cursor[count - 1] = '\0';
+                if (*cursor) Log("[ngx-log] %s", cursor);
+                if (!end) break;
+                cursor = end + 1;
+            }
+        } while (copied < 4 && FindNextFileW(search, &found));
+        FindClose(search);
+    }
+    if (!copied) Log("[ngx-log] no readable current-run internal log in %ls (absent or buffered)", directory);
+    s.diagnosticCopied = copied != 0;
+}
+
 bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height,
                    VkCommandBuffer recordingCmd) {
     if (s.disabled || !s.params || pass >= kMaxPasses) return false;
@@ -751,6 +820,7 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
             pass, (uint32_t)createResult, NgxResultName(createResult), int(s.features[pass] != nullptr));
         if (createResult == NVSDK_NGX_Result_FAIL_PlatformError)
             Log("[ngx] PlatformError does not identify the failing dependency; check runtime and driver logs");
+        LogModelDiagnostics(s);
         s.features[pass] = nullptr;
         // Only the first pass failing is fatal; a later one failing simply caps the chain, which is
         // what a memory ceiling looks like and is not a reason to lose the pass altogether.
@@ -936,6 +1006,8 @@ void NgxTeardown(NgxSnippet& s, VkDevice device) {
     if (s.core) { FreeLibrary(s.core); s.core = nullptr; }
     if (s.snippet) { FreeLibrary(s.snippet); s.snippet = nullptr; }
     if (s.nvapi) { FreeLibrary(s.nvapi); s.nvapi = nullptr; }
+    // Some runtimes only flush logs or update file times when the writer closes.
+    if (s.disabled && !s.diagnosticCopied) LogModelDiagnostics(s);
     s = {};
 }
 

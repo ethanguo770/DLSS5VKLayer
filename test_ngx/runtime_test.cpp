@@ -1,6 +1,7 @@
 #include "../core/ngx_snippet.h"
 #include "../core/guard.h"
 #include "../core/model_profile.h"
+#include "../helper/vulkan_features.h"
 #include <cstdio>
 #include <cstring>
 
@@ -38,13 +39,65 @@ static bool CheckGeneration() {
     return true;
 }
 
+static bool addressSupported = true;
+static void VKAPI_CALL MockFeatures(VkPhysicalDevice, VkPhysicalDeviceFeatures2* output) {
+    void* current = output->pNext;
+    while (current) {
+        VkStructureType type;
+        void* next;
+        std::memcpy(&type, current, sizeof(type));
+        std::memcpy(&next, static_cast<char*>(current) + offsetof(VkBaseOutStructure, pNext), sizeof(next));
+        if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) {
+            auto* feature = reinterpret_cast<VkPhysicalDeviceBufferDeviceAddressFeatures*>(current);
+            feature->bufferDeviceAddress = addressSupported;
+            feature->bufferDeviceAddressCaptureReplay = VK_TRUE;
+            feature->bufferDeviceAddressMultiDevice = VK_TRUE;
+        } else if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES) {
+            reinterpret_cast<VkPhysicalDeviceSynchronization2Features*>(current)->synchronization2 = VK_TRUE;
+        } else if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV) {
+            reinterpret_cast<VkPhysicalDeviceOpticalFlowFeaturesNV*>(current)->opticalFlow = VK_TRUE;
+        }
+        current = next;
+    }
+}
+
+static bool CheckDeviceFeatureContract() {
+    for (bool sync : {false, true}) for (bool flow : {false, true}) {
+        dlssnr::NeuralDeviceFeatures features;
+        if (!features.Query(nullptr, MockFeatures, sync, flow) ||
+            !features.address.bufferDeviceAddress || features.address.bufferDeviceAddressCaptureReplay ||
+            features.address.bufferDeviceAddressMultiDevice ||
+            bool(features.sync.synchronization2) != sync || bool(features.flow.opticalFlow) != flow) {
+            std::fprintf(stderr, "Feature query failed sync=%d flow=%d returned=%u/%u/%u\n",
+                sync, flow, features.address.bufferDeviceAddress, features.sync.synchronization2, features.flow.opticalFlow);
+            return false;
+        }
+        // Follow the actual chain consumed by vkCreateDevice, not copies of flags.
+        unsigned count = 0;
+        void* current = &features.address;
+        while (current && count < 4) {
+            ++count;
+            std::memcpy(&current, static_cast<char*>(current) + offsetof(VkBaseOutStructure, pNext), sizeof(current));
+        }
+        if (count != 1u + sync + flow || current) {
+            std::fprintf(stderr, "Feature chain failed sync=%d flow=%d count=%u\n", sync, flow, count);
+            return false;
+        }
+    }
+    dlssnr::NeuralDeviceFeatures unsupported;
+    addressSupported = false;
+    const bool missingRejected = !unsupported.Query(nullptr, MockFeatures, true, true);
+    addressSupported = true;
+    return missingRejected && !unsupported.Query(nullptr, nullptr, false, false);
+}
+
 int main(int argc, char** argv) {
     if (argc != 4) {
         std::fprintf(stderr, "usage: ngx_runtime_test model-directory log-file mode\n");
         return 2;
     }
     Trace("[test] main entered\n");
-    if (!CheckGeneration()) return 1;
+    if (!CheckGeneration() || !CheckDeviceFeatureContract()) return 1;
     SetEnvironmentVariableA("DLSSNR_BIN_DIR", argv[1]);
     SetEnvironmentVariableA("DLSSNR_LOG", argv[2]);
     SetEnvironmentVariableA("DLSSNR_TEST_MODE", argv[3]);
