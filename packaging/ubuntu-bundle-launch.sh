@@ -79,7 +79,8 @@ for bits, directory, name in [('64', 'layer', 'VK_LAYER_NV_dlssnr'),
               + ', '.join(str(file) for file, _ in existing))
         continue
     document = json.loads((root / 'layer/manifest.json').read_text())
-    document['layer'].update(name=name, library_path=str(library), library_arch=bits)
+    layer = document.pop('layer')
+    layer.update(name=name, library_path=str(library), library_arch=bits)
     destination.mkdir(parents=True, exist_ok=True)
     # Never overwrite an unrelated file even when it happens to use our name.
     if target.exists():
@@ -90,6 +91,9 @@ for bits, directory, name in [('64', 'layer', 'VK_LAYER_NV_dlssnr'),
         if previous.get('dlssnr_portable_manifest') != 1:
             raise SystemExit('Refusing to replace an unrelated manifest: ' + str(target))
     document['dlssnr_portable_manifest'] = 1
+    # Keep the ownership marker before the real layer entry. Some Vulkan
+    # loaders count every top-level object after "layer" as another layer.
+    document['layer'] = layer
     fd, temporary = tempfile.mkstemp(prefix='.dlssnr-', suffix='.tmp', dir=destination)
     try:
         with os.fdopen(fd, 'w') as stream:
