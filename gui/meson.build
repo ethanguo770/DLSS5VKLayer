@@ -1,5 +1,5 @@
 qt6 = import('qt6')
-qt6_dep = dependency('qt6', modules: ['Widgets'])
+qt6_dep = dependency('qt6', modules: ['Core', 'Gui', 'Widgets'])
 gui_inc = include_directories('../common', '../layer_linux/src')
 
 gui_sources = files(

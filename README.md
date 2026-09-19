@@ -4,6 +4,45 @@ DLSS5VKLayer is a Linux Vulkan layer plus helper service that forwards presented
 
 This project is experimental. It is intended for local testing and research.
 
+## Ubuntu 22.04 Desktop: one-folder test package
+
+The Ubuntu-specific bundle includes the Qt interface, a private Wine 11 runtime
+for the helper, DXVK/NVAPI runtime DLLs, and the Vulkan layers. Extract the complete
+`dlssnr-ubuntu22.04-x86_64.tar.gz` folder to a permanent location and double-click
+**DLSSNR**. No compiler, Qt installation, system Wine, Steam or Proton setup is
+needed for the helper. The host supplies Ubuntu 22.04 Desktop x86_64 and a working
+NVIDIA Vulkan driver; the bundled DXVK 3.1 requires Vulkan 1.4 and NVIDIA driver
+575.51.02 or newer. GPU model alone does not prove compatibility.
+
+On first use, import `nvngx_dlssnr.dll` in the interface if the package does not
+include it. Use **Check setup** for diagnostics and **Start helper** to prepare
+the private prefix and start processing. Progress and failures remain in the
+same window, with output under **Details**. Start your game as before, with
+`VKLayer_DLSS5=1`; game launching and rendering are unchanged. The interface
+continues to provide effect controls, comparisons and matched screenshots.
+
+The launcher registers only its own user Vulkan manifests and leaves global
+environment settings alone. A conflicting older layer is reported in the
+interface and blocks startup; matching existing libraries are reused. Run the
+launcher again after moving the extracted folder. The included Wine is for the
+64-bit helper, not a replacement for your game's existing runner.
+
+To build the bundle on Ubuntu 22.04 (including WSL):
+
+```bash
+tools/meson-build.sh
+tools/meson-build.sh test
+python3 packaging/make-ubuntu-bundle.py
+```
+
+The bundle builder downloads and verifies pinned runtime archives and copies
+runtime libraries from the build host. It fails on missing libraries or invalid
+hashes. Optional `--binaries /path/to/dlls` includes an existing model directory;
+without it, model import stays in the GUI. See the bundle's `README.txt` and
+`bundle-metadata.json` for contents and host requirements. Build-time packages
+also include `qt6-wayland`, X11 development headers, `libsane1` and
+`libxkbregistry0`; these are handled by the packager, not the end user.
+
 ## Features
 
 - Vulkan implicit layer for native Linux games and Proton games.

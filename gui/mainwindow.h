@@ -10,6 +10,7 @@
 #include "../common/shm_protocol.h"
 
 class QProcess;
+class QPlainTextEdit;
 class QPushButton;
 class QToolButton;
 class QCheckBox;
@@ -46,6 +47,7 @@ protected:
 private slots:
     void startHelper();
     void stopHelper();
+    void checkSetup();
     void updateStatus();
     void importBinaries();
     void openBinariesFolder();
@@ -77,6 +79,10 @@ private:
     QString settingsBlob() const;
     void populateRunners();
     void applyRunnerSelection(int index);
+    void runHelperCommand(const QString& command);
+    void readHelperOutput();
+    void finishHelperCommand(bool success, const QString& error = QString());
+    void updateHelperControls();
     bool ensureShm();
     QWidget* buildSettings();
     void updateCompositionVisibility();
@@ -98,9 +104,17 @@ private:
     ShmHeader* hdr = nullptr;
 
     QTimer* statusTimer = nullptr;
+    QProcess* helperProcess = nullptr;
+    QString helperCommand;
+    QString helperOutput;
+    QString setupError;
+    bool commandBusy = false;
+    bool closeRequested = false;
+    bool allowClose = false;
 
     QPushButton* startBtn = nullptr;
     QPushButton* stopBtn = nullptr;
+    QPushButton* checkSetupBtn = nullptr;
     QComboBox* profileCombo = nullptr;
     QPushButton* profileSaveBtn = nullptr;
     QPushButton* passBtn = nullptr;
@@ -111,7 +125,11 @@ private:
     QComboBox* keyCombo = nullptr;
     QLineEdit* runnerPathEdit = nullptr;
     QAction* binariesPathAction = nullptr;
+    QAction* importBinariesAction = nullptr;
     QLabel* statusLabel = nullptr;
+    QLabel* commandStatusLabel = nullptr;
+    QToolButton* commandDetailsBtn = nullptr;
+    QPlainTextEdit* commandDetails = nullptr;
     QSpinBox* captureFrames = nullptr;
     QCheckBox* bypassCheck = nullptr;
     QFormLayout* compositionForm = nullptr;

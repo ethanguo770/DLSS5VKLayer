@@ -97,6 +97,16 @@ load_config() {
   log="$(read_config_value log "$CONFIG_FILE")"
   dxvk_vendor="$(read_config_value dxvk_vendor "$CONFIG_FILE")"
   dxvk_device="$(read_config_value dxvk_device "$CONFIG_FILE")"
+  # A portable package supplies its own runner. Keep a working user selection,
+  # but recover automatically when the package or an old runner was moved.
+  if [ ! -x "$runner_path" ] && [ -x "${DLSSNR_BUNDLED_RUNNER:-}" ]; then
+    runner_type="wine"
+    runner_path="$DLSSNR_BUNDLED_RUNNER"
+  fi
+  if [ ! -f "$binaries/nvngx_dlssnr.dll" ] &&
+     [ -f "${DLSSNR_INSTALL_DIR:-}/helper/binaries/nvngx_dlssnr.dll" ]; then
+    binaries="$DLSSNR_INSTALL_DIR/helper/binaries"
+  fi
   # A config written by an older build pins the mapping to $XDG_RUNTIME_DIR, which is exactly the
   # path a Steam game cannot see. Treat that one value as if it had never been set.
   if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ "$shm" = "$XDG_RUNTIME_DIR/dlssnr/shm.bin" ]; then
@@ -278,11 +288,13 @@ download_runtime_dll() {
 }
 
 install_wine_runtime_dll() {
-  local name="$1" source target
+  local name="$1" source target install_dir source_candidate
   target="$WINE_PREFIX_DIR/drive_c/windows/system32/$name"
+  install_dir="$(detect_install_dir)"
 
   source=""
-  for source_candidate in "$binaries/$name" "$DATA_DIR/binaries/$name"; do
+  for source_candidate in "$binaries/$name" "$DATA_DIR/binaries/$name" \
+                          "$install_dir/runtime-dlls/$name"; do
     if [ -f "$source_candidate" ]; then source="$source_candidate"; break; fi
   done
   if [ -z "$source" ]; then source="$(detect_runner_dll "$name" || true)"; fi
@@ -487,7 +499,10 @@ detect_gpu() {
 default_config() {
   local p w id
   p="$(detect_proton)"
-  if [ -n "$p" ]; then
+  if [ -x "${DLSSNR_BUNDLED_RUNNER:-}" ]; then
+    runner_type="wine"
+    runner_path="$DLSSNR_BUNDLED_RUNNER"
+  elif [ -n "$p" ]; then
     runner_type="proton"
     runner_path="$p"
   else
@@ -750,6 +765,7 @@ cmd_start() {
     echo "  log: $log"
   else
     echo "helper failed to start; check $log" >&2
+    if [ -f "$log" ]; then tail -n 40 -- "$log" >&2; fi
     return 1
   fi
 }
@@ -940,7 +956,8 @@ cmd_runners() {
 cmd_doctor() {
   ensure_dirs
   load_config
-  local ok=0 helper dll nvapi dxgi det_runner_type det_runner_path det_binaries det_prefix
+  local ok=0 helper dll nvapi dxgi det_runner_type det_runner_path det_binaries det_prefix install_dir
+  install_dir="$(detect_install_dir)"
   helper="$(detect_helper_exe || true)"
   dll="$(detect_dxvk_dll || true)"
   det_runner_type="$runner_type"
@@ -1021,6 +1038,8 @@ cmd_doctor() {
     if [ -z "$dxgi" ] && [ -f "$det_binaries/dxgi.dll" ]; then dxgi="$det_binaries/dxgi.dll"; fi
     if [ -z "$nvapi" ] && [ -f "$DATA_DIR/binaries/nvapi64.dll" ]; then nvapi="$DATA_DIR/binaries/nvapi64.dll"; fi
     if [ -z "$dxgi" ] && [ -f "$DATA_DIR/binaries/dxgi.dll" ]; then dxgi="$DATA_DIR/binaries/dxgi.dll"; fi
+    if [ -z "$nvapi" ] && [ -f "$install_dir/runtime-dlls/nvapi64.dll" ]; then nvapi="$install_dir/runtime-dlls/nvapi64.dll"; fi
+    if [ -z "$dxgi" ] && [ -f "$install_dir/runtime-dlls/dxgi.dll" ]; then dxgi="$install_dir/runtime-dlls/dxgi.dll"; fi
     printf 'wine DXVK-NVAPI nvapi64.dll: %s\n' "${nvapi:-missing (downloaded on start)}"
     printf 'wine DXVK dxgi.dll: %s\n' "${dxgi:-missing (downloaded on start)}"
     if [ -n "$nvapi" ] && [ -n "$dxgi" ]; then

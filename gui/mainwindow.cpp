@@ -33,6 +33,7 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QPixmap>
+#include <QPlainTextEdit>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPushButton>
@@ -295,12 +296,22 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     auto* root = new QVBoxLayout(this);
 
     statusLabel = new QLabel(this);
+    statusLabel->setObjectName("helperStatus");
     statusLabel->setTextFormat(Qt::RichText);
     root->addWidget(statusLabel);
+    setupError = qEnvironmentVariable("DLSSNR_SETUP_ERROR");
+    if (!setupError.isEmpty()) {
+        auto* issue = new QLabel("Setup needs attention: " + setupError, this);
+        issue->setObjectName("setupIssue");
+        issue->setTextFormat(Qt::PlainText);
+        issue->setWordWrap(true);
+        root->addWidget(issue);
+    }
 
     auto* runnerForm = new QFormLayout;
     runnerCombo = new QComboBox(this);
     runnerPathEdit = new QLineEdit(this);
+    runnerPathEdit->setObjectName("runnerPath");
     browseRunnerBtn = new QPushButton("Browse...", this);
     auto* runnerPathRow = new QHBoxLayout;
     runnerPathRow->addWidget(runnerPathEdit);
@@ -321,6 +332,9 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     auto* buttons = new QHBoxLayout;
     startBtn = new QPushButton("Start helper", this);
     stopBtn = new QPushButton("Stop helper", this);
+    startBtn->setObjectName("startHelper");
+    stopBtn->setObjectName("stopHelper");
+    startBtn->setToolTip("Prepare the helper runtime if needed, then start it. First use may download runtime components.");
     profileCombo = new QComboBox(this);
     profileCombo->setToolTip("Select a saved profile to load, or choose '(default)' to reset.");
     profileReloadBtn = new QToolButton(this);
@@ -336,6 +350,45 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     buttons->addWidget(profileCombo);
     buttons->addWidget(profileSaveBtn);
     root->addLayout(buttons);
+    auto* commandRow = new QHBoxLayout;
+    commandStatusLabel = new QLabel(this);
+    commandStatusLabel->setObjectName("commandStatus");
+    commandStatusLabel->setTextFormat(Qt::PlainText);
+    commandStatusLabel->setWordWrap(true);
+    commandRow->addWidget(commandStatusLabel, 1);
+    commandDetailsBtn = new QToolButton(this);
+    commandDetailsBtn->setObjectName("commandDetailsToggle");
+    commandDetailsBtn->setText("Details");
+    commandDetailsBtn->setCheckable(true);
+    commandDetailsBtn->setArrowType(Qt::RightArrow);
+    commandDetailsBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    commandDetailsBtn->setEnabled(false);
+    commandRow->addWidget(commandDetailsBtn);
+    root->addLayout(commandRow);
+    commandDetails = new QPlainTextEdit(this);
+    commandDetails->setObjectName("commandDetails");
+    commandDetails->setReadOnly(true);
+    commandDetails->setMaximumHeight(120);
+    commandDetails->setVisible(false);
+    root->addWidget(commandDetails);
+    connect(commandDetailsBtn, &QToolButton::toggled, this, [this](bool expanded) {
+        commandDetails->setVisible(expanded);
+        commandDetailsBtn->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+    });
+    helperProcess = new QProcess(this);
+    helperProcess->setProcessChannelMode(QProcess::MergedChannels);
+    connect(helperProcess, &QProcess::readyReadStandardOutput, this, &MainWindow::readHelperOutput);
+    connect(helperProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart)
+            finishHelperCommand(false, "Could not launch helper command: " + helperProcess->errorString());
+    });
+    connect(helperProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+            [this](int exitCode, QProcess::ExitStatus exitStatus) {
+        const bool success = exitStatus == QProcess::NormalExit && exitCode == 0;
+        finishHelperCommand(success, success ? QString() :
+            (exitStatus == QProcess::CrashExit ? "Helper command crashed." :
+             QString("Helper command failed (exit %1).").arg(exitCode)));
+    });
     connect(profileReloadBtn, &QToolButton::clicked, this, [this] {
         const int idx = profileCombo->currentIndex();
         if (idx > 0) loadSettingsFromFile(profileCombo->itemData(idx).toString());
@@ -414,9 +467,9 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     binariesPathAction->setEnabled(false);
     binariesPathAction->setToolTip(FormatTip(
         "Where the NVIDIA NGX DLLs live. The helper loads nvngx_dlssnr.dll from here.\n"
-        "These are NVIDIA's proprietary files and are not shipped with this package -- import your own."));
-    auto* importAction = binariesMenu->addAction("Import binaries...", this, &MainWindow::importBinaries);
-    importAction->setToolTip(FormatTip(
+        "If no model is included in the package, import it from your existing files."));
+    importBinariesAction = binariesMenu->addAction("Import binaries...", this, &MainWindow::importBinaries);
+    importBinariesAction->setToolTip(FormatTip(
         "Copy the NVIDIA NGX DLLs from a folder you choose into the binaries folder.\n"
         "Pick the folder that holds nvngx_dlssnr.dll (and nvngx.dll, nvapi64.dll, sl.*.dll if you have "
         "them).\n"
@@ -430,12 +483,17 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
         hdr->controlSeq.fetch_add(1);
     });
     auto* bottom = new QHBoxLayout;
+    checkSetupBtn = new QPushButton("Check setup", this);
+    checkSetupBtn->setObjectName("checkSetup");
+    checkSetupBtn->setToolTip("Check the helper, runner, model files and runtime paths. Results appear in Details.");
+    bottom->addWidget(checkSetupBtn);
     bottom->addStretch(1);
     bottom->addWidget(gearBtn);
     root->addLayout(bottom);
 
     connect(startBtn, &QPushButton::clicked, this, &MainWindow::startHelper);
     connect(stopBtn, &QPushButton::clicked, this, &MainWindow::stopHelper);
+    connect(checkSetupBtn, &QPushButton::clicked, this, &MainWindow::checkSetup);
     connect(profileSaveBtn, &QPushButton::clicked, this, &MainWindow::saveSettingsToFile);
     connect(profileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
         fitProfileCombo(profileCombo);
@@ -480,13 +538,21 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
-    if (statusTimer) statusTimer->stop();
-    if (hdr) hdr->quit.store(1);
     windowW = width();
     windowH = height();
     saveConfig();
-    if (helperCliPath.isEmpty()) helperCliPath = findHelperCli();
-    if (!helperCliPath.isEmpty()) QProcess::startDetached(helperCliPath, {"stop"});
+    if (!allowClose) {
+        event->ignore();
+        closeRequested = true;
+        if (commandBusy) {
+            commandStatusLabel->setText("Closing after the current helper command finishes...");
+            updateHelperControls();
+        } else {
+            stopHelper();
+        }
+        return;
+    }
+    if (statusTimer) statusTimer->stop();
     QWidget::closeEvent(event);
 }
 
@@ -551,7 +617,10 @@ QString MainWindow::findProjectDir() const {
 
 QString MainWindow::findHelperCli() const {
     const QString env = qEnvironmentVariable("DLSSNR_HELPER_CLI");
-    if (!env.isEmpty() && QFile::exists(env)) return env;
+    if (!env.isEmpty()) return env;
+
+    const QString sibling = QCoreApplication::applicationDirPath() + "/dlssnr-helper";
+    if (QFileInfo(sibling).isFile() && QFileInfo(sibling).isExecutable()) return sibling;
 
     const QString found = QStandardPaths::findExecutable("dlssnr-helper");
     if (!found.isEmpty()) return found;
@@ -563,7 +632,7 @@ QString MainWindow::findHelperCli() const {
         "/usr/local/bin/dlssnr-helper"
     };
     for (const QString& c : candidates) {
-        if (QFile::exists(c)) return c;
+        if (QFileInfo(c).isFile() && QFileInfo(c).isExecutable()) return c;
     }
     return QString();
 }
@@ -596,7 +665,12 @@ QString MainWindow::defaultBinariesDir() const {
 // was ever imported. The import always writes into defaultBinariesDir(), so a config path that points
 // elsewhere is only ever a hand-edit or a leftover from the CLI's discovery.
 QString MainWindow::effectiveBinariesDir() const {
-    return binariesPath.isEmpty() ? defaultBinariesDir() : binariesPath;
+    const QString configured = binariesPath.isEmpty() ? defaultBinariesDir() : binariesPath;
+    if (QFile::exists(configured + "/nvngx_dlssnr.dll")) return configured;
+    const QString installDir = qEnvironmentVariable("DLSSNR_INSTALL_DIR");
+    const QString bundled = installDir + "/helper/binaries";
+    if (!installDir.isEmpty() && QFile::exists(bundled + "/nvngx_dlssnr.dll")) return bundled;
+    return configured;
 }
 
 // nvngx_dlssnr.dll is the one file the helper cannot work without -- neural processing stays disabled
@@ -684,7 +758,7 @@ void MainWindow::saveConfig() {
     QTextStream out(&f);
     out << "runner_type=" << runnerType << "\n";
     out << "runner_path=" << runnerPath << "\n";
-    out << "binaries=" << binariesPath << "\n";
+    out << "binaries=" << effectiveBinariesDir() << "\n";
     out << "shm=" << shmPath << "\n";
     out << "log=" << logPath << "\n";
     out << "dxvk_vendor=" << dxvkVendor << "\n";
@@ -948,6 +1022,19 @@ void MainWindow::populateRunners() {
     const QSignalBlocker blocker(runnerCombo);
     runnerCombo->clear();
 
+    const QString bundled = qEnvironmentVariable("DLSSNR_BUNDLED_RUNNER");
+    const QFileInfo bundledInfo(bundled);
+    if (bundledInfo.isAbsolute() && bundledInfo.isFile() && bundledInfo.isExecutable()) {
+        QVariantMap data;
+        data["type"] = "wine";
+        data["path"] = bundled;
+        runnerCombo->addItem("Included Wine runtime", data);
+        if (!QFileInfo(runnerPath).isFile() || !QFileInfo(runnerPath).isExecutable()) {
+            runnerType = "wine";
+            runnerPath = bundled;
+        }
+    }
+
     const auto runners = dlssnr::discoverCustomRunners();
     for (const auto& r : runners) {
         QVariantMap data;
@@ -974,7 +1061,8 @@ void MainWindow::populateRunners() {
     }
     if (!selected && !runnerPath.isEmpty()) {
         QVariantMap data;
-        data["type"] = runnerPath.contains("proton", Qt::CaseInsensitive) ? "proton" : "wine";
+        data["type"] = runnerType.isEmpty() ?
+            (runnerPath.contains("proton", Qt::CaseInsensitive) ? "proton" : "wine") : runnerType;
         data["path"] = runnerPath;
         runnerCombo->addItem("Custom: " + runnerPath, data);
         runnerCombo->setCurrentIndex(runnerCombo->count() - 1);
@@ -1026,32 +1114,96 @@ bool MainWindow::ensureShm() {
 }
 
 void MainWindow::startHelper() {
-    if (helperCliPath.isEmpty()) helperCliPath = findHelperCli();
-    if (helperCliPath.isEmpty()) {
-        QMessageBox::warning(this, "DLSS5VKLayer", "dlssnr-helper CLI not found.");
-        return;
-    }
+    if (commandBusy || closeRequested || !setupError.isEmpty()) return;
     if (!ensureShm()) {
-        QMessageBox::warning(this, "DLSS5VKLayer", "Could not open shared memory file.");
+        commandStatusLabel->setText("Could not open shared memory file: " + shmPath);
         return;
     }
     if (hdr) hdr->quit.store(0);
     saveConfig();
-    QProcess::startDetached(helperCliPath, {"start"});
-    // The poll confirms it a second later; greying the button now stops a second click from looking
-    // ignored while the launcher is still bringing the prefix up.
-    startBtn->setEnabled(false);
-    updateStatus();
+    runHelperCommand("start");
 }
 
 void MainWindow::stopHelper() {
-    if (helperCliPath.isEmpty()) helperCliPath = findHelperCli();
+    if (commandBusy) return;
     if (hdr) hdr->quit.store(1);
-    if (!helperCliPath.isEmpty()) {
-        QProcess::startDetached(helperCliPath, {"stop"});
+    runHelperCommand("stop");
+}
+
+void MainWindow::checkSetup() {
+    if (commandBusy || closeRequested) return;
+    saveConfig();
+    runHelperCommand("doctor");
+}
+
+void MainWindow::runHelperCommand(const QString& command) {
+    if (commandBusy) return;
+    helperCliPath = findHelperCli();
+    helperCommand = command;
+    helperOutput.clear();
+    commandDetails->clear();
+    commandDetailsBtn->setEnabled(false);
+    commandBusy = true;
+    commandStatusLabel->setText(command == "start" ?
+        "Preparing and starting helper... First use may download runtime components." :
+        command == "doctor" ? "Checking setup..." : "Stopping helper...");
+    updateHelperControls();
+    if (helperCliPath.isEmpty()) {
+        finishHelperCommand(false, "dlssnr-helper CLI was not found. Place it beside the interface, then retry.");
+        return;
     }
-    stopBtn->setEnabled(false);
+    helperProcess->setProcessEnvironment(QProcessEnvironment::systemEnvironment());
+    helperProcess->start(helperCliPath, {command});
+}
+
+void MainWindow::readHelperOutput() {
+    helperOutput += QString::fromLocal8Bit(helperProcess->readAllStandardOutput());
+    // Keep recent diagnostics bounded even if a runner produces a very noisy log.
+    if (helperOutput.size() > 128 * 1024) helperOutput = helperOutput.right(128 * 1024);
+    commandDetails->setPlainText(helperOutput);
+    commandDetailsBtn->setEnabled(!helperOutput.isEmpty());
+}
+
+void MainWindow::finishHelperCommand(bool success, const QString& error) {
+    if (!commandBusy) return;
+    readHelperOutput();
+    commandBusy = false;
+    if (success) {
+        commandStatusLabel->setText(helperCommand == "doctor" ?
+            "Setup check passed. Start the helper when ready." : helperCommand == "stop" ?
+            "Stop command completed." :
+            "Start command completed. Check Helper status above; the game supplies frames when running.");
+    } else {
+        const QStringList lines = helperOutput.trimmed().split('\n', Qt::SkipEmptyParts);
+        const QString lastLine = lines.isEmpty() ? QString() : lines.last().trimmed().left(220);
+        commandStatusLabel->setText(error + (lastLine.isEmpty() ? QString() : " " + lastLine) +
+                                   " See Details and retry after fixing the issue.");
+        if (!error.isEmpty()) {
+            helperOutput += (helperOutput.endsWith('\n') ? QString() : "\n") + error + "\n";
+            commandDetails->setPlainText(helperOutput);
+            commandDetailsBtn->setEnabled(true);
+        }
+    }
     updateStatus();
+    if (closeRequested) {
+        if (helperCommand == "stop") {
+            allowClose = true;
+            QTimer::singleShot(0, this, &QWidget::close);
+        } else {
+            QTimer::singleShot(0, this, &MainWindow::stopHelper);
+        }
+    }
+}
+
+void MainWindow::updateHelperControls() {
+    const bool available = !commandBusy && !closeRequested;
+    startBtn->setEnabled(available && !helperRunning && setupError.isEmpty());
+    stopBtn->setEnabled(available && helperRunning);
+    checkSetupBtn->setEnabled(available);
+    runnerCombo->setEnabled(available && !helperRunning);
+    runnerPathEdit->setEnabled(available && !helperRunning);
+    browseRunnerBtn->setEnabled(available && !helperRunning);
+    importBinariesAction->setEnabled(available);
 }
 
 // The GUI twin of `dlssnr-helper import-binaries`: copy the NVIDIA NGX DLLs the user already owns out
@@ -1197,8 +1349,7 @@ void MainWindow::updateStatus() {
     updateCompositionVisibility();
 
     helperRunning = helperRunningNow();
-    startBtn->setEnabled(!helperRunning);
-    stopBtn->setEnabled(helperRunning);
+    updateHelperControls();
 
     // A layer or helper from an older build re-initialises the mapping to its own version and keeps
     // running with its old field set -- every setting this side writes lands in a struct the other
@@ -1266,7 +1417,15 @@ void MainWindow::updateStatus() {
 void MainWindow::updateCompositionVisibility() {
     if (!compositionForm) return;
     const bool bypass = hdr && hdr->compositionBypass.load() != 0;
-    for (QWidget* w : compositionRows) compositionForm->setRowVisible(w, !bypass);
+    for (QWidget* w : compositionRows) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 4, 0)
+        compositionForm->setRowVisible(w, !bypass);
+#else
+        // Ubuntu 22.04 ships Qt 6.2, before QFormLayout::setRowVisible.
+        w->setVisible(!bypass);
+        if (QWidget* label = compositionForm->labelForField(w)) label->setVisible(!bypass);
+#endif
+    }
 }
 
 // The settings, on tabs.

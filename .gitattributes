@@ -1,0 +1,3 @@
+*.sh text eol=lf
+dlssnr-helper text eol=lf
+*.py text eol=lf
