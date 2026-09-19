@@ -25,6 +25,19 @@ executable('smoke', '../test_layer/smoke.cpp',
   install: false,
 )
 
+# Test-only DLLs exercise the actual Windows loader and NGX boundary without a GPU.
+shared_library('ngx_mock_snippet', '../test_ngx/mock_snippet.cpp',
+  include_directories: windows_inc, link_args: windows_cpp_link_args,
+  name_prefix: '', install: false,
+)
+shared_library('ngx_mock_nvapi', '../test_ngx/mock_nvapi.cpp',
+  link_args: windows_cpp_link_args, name_prefix: '', install: false,
+)
+executable('ngx_runtime_test',
+  '../test_ngx/runtime_test.cpp', '../core/ngx_snippet.cpp', '../core/guard.cpp',
+  include_directories: windows_inc, link_args: windows_cpp_link_args, install: false,
+)
+
 # Keep a descriptive alias for the Windows cross build's analyzer target.
 if scan_build.found()
   run_target('analyze-windows',

@@ -35,12 +35,10 @@ struct NgxSnippet {
     uint32_t featureCount = 0;
     uint32_t featureW = 0, featureH = 0;
 
+    bool initialized = false; // module, parameter block and NGX context can be reused
     bool ready = false;     // snippet init + CreateFeature(18) succeeded
     bool disabled = false;  // latched failure -> pass-through forever
 
-    // Captured from NVSDK_NGX_VULKAN_GetFeatureRequirements (bit 0 = HDR path).
-    unsigned int featureFlags = 0;
-    bool hdrCapable = false;
     // Whether the feature is being built as HDR. The helper sets it before the first create and on
     // every switch; NgxCreatePass rewrites the create flags and the tonemap hint from it, so a
     // rebuild after a toggle carries the new contract without re-running init.
@@ -88,7 +86,9 @@ struct NgxTuning {
 void NgxSetCreateTuning(NgxSnippet& s, const NgxTuning& t);
 void NgxSetHdr(NgxSnippet& s, bool want);
 
-// Loads the snippet, initialises it, and builds pass 0.
+// Loads and initialises the snippet once, then builds pass 0. Further calls on
+// the same Vulkan context reuse the modules and parameters. The caller must
+// finish GPU work using existing features before requesting a rebuild.
 //
 // The tuning is passed in rather than set by the caller beforehand because this function writes its
 // own create contract -- preset among it -- and would otherwise overwrite whatever the caller had

@@ -2532,8 +2532,9 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     // the frames it takes to switch, and every copy below sizes itself by hdrEncode, never by hope.
     const uint32_t hdrActive = shm.hdr->hdrActive.load() ? 1u : 0u;
     const uint32_t hdrEncode = shm.hdr->hdrEncode.load() ? 1u : 0u;
-    const bool wantHdr = hdrActive && !ns.hdrRejected &&
-                         (!ns.ngx.snippet || ns.ngx.hdrCapable);
+    // Feature requirements describe platform support, not HDR input support.
+    // Try the requested format and retain the existing SDR fallback on refusal.
+    const bool wantHdr = hdrActive && !ns.hdrRejected;
     const size_t bytes = px * (hdrEncode ? 8 : 4);
 
     // The switch. One frame's worth of refusal, and every surface -- crossing, chain and feature

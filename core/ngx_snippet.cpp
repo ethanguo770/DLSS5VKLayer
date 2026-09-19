@@ -107,6 +107,33 @@ static void RemoveCallerSpoof(SpoofState& state) {
 // ---------------------------------------------------------------------------
 // Param helpers + guarded NGX calls
 // ---------------------------------------------------------------------------
+static const char* NgxResultName(NVSDK_NGX_Result r) {
+    switch (r) {
+    case NVSDK_NGX_Result_Success: return "Success";
+    case NVSDK_NGX_Result_Fail: return "Fail";
+    case NVSDK_NGX_Result_FAIL_FeatureNotSupported: return "FeatureNotSupported";
+    case NVSDK_NGX_Result_FAIL_PlatformError: return "PlatformError";
+    case NVSDK_NGX_Result_FAIL_FeatureAlreadyExists: return "FeatureAlreadyExists";
+    case NVSDK_NGX_Result_FAIL_FeatureNotFound: return "FeatureNotFound";
+    case NVSDK_NGX_Result_FAIL_InvalidParameter: return "InvalidParameter";
+    case NVSDK_NGX_Result_FAIL_ScratchBufferTooSmall: return "ScratchBufferTooSmall";
+    case NVSDK_NGX_Result_FAIL_NotInitialized: return "NotInitialized";
+    case NVSDK_NGX_Result_FAIL_UnsupportedInputFormat: return "UnsupportedInputFormat";
+    case NVSDK_NGX_Result_FAIL_RWFlagMissing: return "RWFlagMissing";
+    case NVSDK_NGX_Result_FAIL_MissingInput: return "MissingInput";
+    case NVSDK_NGX_Result_FAIL_UnableToInitializeFeature: return "UnableToInitializeFeature";
+    case NVSDK_NGX_Result_FAIL_OutOfDate: return "OutOfDate";
+    case NVSDK_NGX_Result_FAIL_OutOfGPUMemory: return "OutOfGPUMemory";
+    case NVSDK_NGX_Result_FAIL_UnsupportedFormat: return "UnsupportedFormat";
+    case NVSDK_NGX_Result_FAIL_UnableToWriteToAppDataPath: return "UnableToWriteToAppDataPath";
+    case NVSDK_NGX_Result_FAIL_UnsupportedParameter: return "UnsupportedParameter";
+    case NVSDK_NGX_Result_FAIL_Denied: return "Denied";
+    case NVSDK_NGX_Result_FAIL_NotImplemented: return "NotImplemented";
+    case NVSDK_NGX_Result_FAIL_SEH: return "GuardedException";
+    default: return "UnknownResult";
+    }
+}
+
 static bool ParamSetUI(NVSDK_NGX_Parameter* p, const char* n, unsigned int v, DWORD* seh) {
     Guarded([&] { p->Set(n, v); return true; }, false, seh);
     return *seh == 0;
@@ -165,6 +192,30 @@ static bool FileExists(const std::wstring& p) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static void LogModulePath(const char* name, HMODULE module) {
+    wchar_t path[4096]{};
+    SetLastError(ERROR_SUCCESS);
+    DWORD count = GetModuleFileNameW(module, path, ARRAYSIZE(path));
+    if (count && count < ARRAYSIZE(path))
+        Log("[ngx] %s loaded at %p path=%ls", name, (void*)module, path);
+    else
+        Log("[ngx] %s loaded at %p; module path unavailable (error=%lu)",
+            name, (void*)module, GetLastError());
+}
+
+static HMODULE LoadOptionalModule(const wchar_t* path, DWORD flags) {
+    DWORD seh = 0, error = ERROR_SUCCESS;
+    HMODULE module = Guarded([&] {
+        SetLastError(ERROR_SUCCESS);
+        HMODULE loaded = LoadLibraryExW(path, nullptr, flags);
+        if (!loaded) error = GetLastError();
+        return loaded;
+    }, (HMODULE)nullptr, &seh);
+    if (!module)
+        Log("[ngx] optional module load failed: %ls (error=%lu seh=%#x)", path, error, seh);
+    return module;
+}
+
 static std::wstring ResolveBinDir() {
     wchar_t env[MAX_PATH];
     if (GetEnvironmentVariableW(L"DLSSNR_BIN_DIR", env, MAX_PATH) > 0 &&
@@ -186,10 +237,8 @@ static void RegisterPeRange(const char* name, HMODULE mod) {
 // ---------------------------------------------------------------------------
 // Load + init (everything up to and including CreateFeature(18))
 // ---------------------------------------------------------------------------
-bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
-                    uint32_t width, uint32_t height, VkCommandBuffer recordingCmd,
-                    const NgxTuning& tuning) {
-    if (s.disabled) return false;
+static bool LoadModulesAndParameters(NgxSnippet& s, VkInstance instance,
+                                    VkPhysicalDevice pd, VkDevice device) {
     s.binDir = ResolveBinDir();
     if (s.binDir.empty()) { Log("[ngx] nvngx_dlssnr.dll not found (set DLSSNR_BIN_DIR)"); s.disabled = true; return false; }
     Log("[ngx] bin dir: %ls", s.binDir.c_str());
@@ -216,25 +265,28 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
 
     if (!InstallCallerSpoof(s.snippet, g_snippetSpoof)) { s.disabled = true; return false; }
 
-    // NVAPI. The handle is never called into by this code -- nvapi64.dll is loaded only so a snippet
-    // that resolves NVAPI by name finds this copy rather than failing -- so when the runner already
-    // supplies NVAPI (Proton/DXVK-NVAPI, which the launcher announces with DLSSNR_SKIP_NVAPI) we skip
-    // it outright: forcing the vendored nvapi64.dll in there bypasses the DXVK-NVAPI override and
-    // faults inside its DllMain. The load is guarded either way, because a bad nvapi64 has to degrade
-    // to "no NVAPI", not take the whole helper down -- Guarded() is the only thing standing between a
-    // faulting DllMain and an unhandled exception, and the old bare LoadLibraryExW had no such cover.
+    // Resolve NVAPI through the runner first: bundled Wine installs DXVK-NVAPI in
+    // its prefix's system32, outside the model directory. Keep the existing
+    // runner-managed opt-out and a local-file fallback for standalone installs.
+    // All explicit loads remain guarded against a faulting DLL entry point.
     wchar_t nvenv[MAX_PATH];
     const bool skipNvapi = GetEnvironmentVariableW(L"DLSSNR_SKIP_NVAPI", nvenv, MAX_PATH) > 0 &&
                            nvenv[0] != L'\0' && nvenv[0] != L'0';
     if (skipNvapi) {
         Log("[ngx] nvapi64.dll load skipped (runner supplies NVAPI)");
+        if (HMODULE loaded = GetModuleHandleW(L"nvapi64.dll"))
+            LogModulePath("nvapi64.dll (runner)", loaded);
     } else {
-        DWORD seh2 = 0;
-        s.nvapi = Guarded([&] {
-            return LoadLibraryExW((s.binDir + L"\\nvapi64.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        }, (HMODULE)nullptr, &seh2);
-        if (s.nvapi) RegisterPeRange("nvapi64.dll", s.nvapi);
-        else Log("[ngx] nvapi64.dll not loaded (seh=%#x); continuing without it", seh2);
+        s.nvapi = LoadOptionalModule(L"nvapi64.dll", 0);
+        const std::wstring localNvapi = s.binDir + L"\\nvapi64.dll";
+        if (!s.nvapi && FileExists(localNvapi))
+            s.nvapi = LoadOptionalModule(localNvapi.c_str(), LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (s.nvapi) {
+            RegisterPeRange("nvapi64.dll", s.nvapi);
+            LogModulePath("nvapi64.dll", s.nvapi);
+        } else {
+            Log("[ngx] nvapi64.dll unavailable; continuing to NGX initialization");
+        }
     }
 
     // Core (nvngx.dll): libmgr prerequisite for snippet init; also param allocator. Optional -- the
@@ -242,13 +294,14 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     // for the same reason as nvapi64: a faulting DllMain here must degrade, not kill the helper.
     std::wstring corePath = s.binDir + L"\\nvngx.dll";
     if (FileExists(corePath)) {
-        DWORD seh2 = 0;
-        s.core = Guarded([&] {
-            return LoadLibraryExW(corePath.c_str(), nullptr,
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-        }, (HMODULE)nullptr, &seh2);
-        if (s.core) InstallCallerSpoof(s.core, g_coreSpoof);
-        else Log("[core] nvngx.dll load faulted (seh=%#x); continuing without core", seh2);
+        s.core = LoadOptionalModule(corePath.c_str(),
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (s.core) {
+            LogModulePath("nvngx.dll", s.core);
+            InstallCallerSpoof(s.core, g_coreSpoof);
+        }
+    } else {
+        Log("[core] optional nvngx.dll absent from model directory; using parameter fallback");
     }
     if (s.core) {
         const char* projectId = "7c134ab9-9677-4af5-a2b2-bca943350861";
@@ -287,8 +340,6 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
             coreInited = NVSDK_NGX_SUCCEED(r);
         }
         Log("[core] init %s", coreInited ? "OK" : "FAILED (continuing)");
-    } else {
-        Log("[core] nvngx.dll not loadable");
     }
 
     // Parameters: DLL allocator preferred (core -> snippet), own 16-slot vtable
@@ -296,7 +347,7 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     // matching API family's allocator).
     {
         DWORD seh2 = 0;
-        NVSDK_NGX_Result r = NVSDK_NGX_Result_FAIL_Failure;
+        NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
         if (s.core) {
             auto coreAlloc = reinterpret_cast<FnVkAllocateParameters>(
                 GetProcAddress(s.core, "NVSDK_NGX_VULKAN_AllocateParameters"));
@@ -337,6 +388,27 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         Log("[params] round-trip self-test: %s (seh=%#x)", ok ? "PASS" : "FAIL", seh2);
         if (!ok) { s.disabled = true; return false; }
     }
+    return true;
+}
+
+bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
+                    uint32_t width, uint32_t height, VkCommandBuffer recordingCmd,
+                    const NgxTuning& tuning) {
+    if (s.disabled) return false;
+    if (!s.initialized) {
+        if (!LoadModulesAndParameters(s, instance, pd, device)) return false;
+    } else {
+        // Resize and HDR fallback enter here after the caller has finished GPU
+        // work. Never reload a hooked module or allocate over a live param block.
+        NgxReleaseAllPasses(s, device);
+        DWORD resetSeh = 0;
+        if (!Guarded([&] { s.params->Reset(); return true; }, false, &resetSeh)) {
+            Log("[ngx] stage=rebuild parameter reset failed (seh=%#x)", resetSeh);
+            s.disabled = true;
+            return false;
+        }
+        Log("[ngx] reusing initialized runtime for %ux%u", width, height);
+    }
 
     // Create parameters (extracted_pipeline_notes.md section 4).
     DWORD seh = 0;
@@ -370,14 +442,13 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     unsigned int createFlags = NVSDK_NGX_DLSS_Feature_Flags_DoSharpening |
                                NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     const char* hdrEnv = getenv("DLSSNR_HDR");
-    const bool wantHdr = s.hdrActive || (hdrEnv && hdrEnv[0] == '1');
+    const bool wantHdr = s.hdrActive || (!s.initialized && hdrEnv && hdrEnv[0] == '1');
     if (wantHdr) createFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     ps &= ParamSetUI(s.params, "Feature_Flags", createFlags, &seh);
     ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_Feature_Flags", createFlags, &seh);
 
-    // Non-destructive exposure: identity pre-exposure/exposure-scale (never
-    // re-pinned per frame) + SDR tonemapped hint unless the HDR path is asked
-    // for and the snippet's feature flags advertise HDR.
+    // Identity exposure values; the requested HDR/SDR contract is applied again
+    // at create time, where unsupported HDR can use the helper's SDR fallback.
     ps &= ParamSetF(s.params, "InPreExposure", 1.0f, &seh);
     ps &= ParamSetF(s.params, "InExposureScale", 1.0f, &seh);
     ps &= ParamSetF(s.params, "NVSDK_NGX_Parameter_PreExposure", 1.0f, &seh);
@@ -386,63 +457,75 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     Log("[params] create contract set: %s (seh=%#x) flags=%#x hdr=%d",
         ps ? "ok" : "FAILED", seh, createFlags, int(wantHdr));
 
-    // Snippet Init_Ext: (appId, path, instance, pd, device, version, featureInfo=nullptr)
-    NVSDK_NGX_Result initResult = NVSDK_NGX_Result_FAIL_NotInitialized;
-    for (NVSDK_NGX_Version ver : { NVSDK_NGX_Version_API_14, NVSDK_NGX_Version_API_13 }) {
-        if (s.initExt) {
-            initResult = CallInitExtSafely(s.initExt, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
-                s.binDir.c_str(), instance, pd, device, ver, &seh);
-            Log("[ngx] VULKAN_Init_Ext(ver=0x%x) -> %#x seh=%#x", ver, (uint32_t)initResult, seh);
-            if (NVSDK_NGX_SUCCEED(initResult)) break;
+    if (!s.initialized) {
+        // Snippet Init_Ext: (appId, path, instance, pd, device, version, featureInfo=nullptr)
+        NVSDK_NGX_Result initResult = NVSDK_NGX_Result_FAIL_NotInitialized;
+        NVSDK_NGX_Version initializedVersion = 0;
+        for (NVSDK_NGX_Version ver : { NVSDK_NGX_Version_API_14, NVSDK_NGX_Version_API_13 }) {
+            if (s.initExt) {
+                initResult = CallInitExtSafely(s.initExt, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
+                    s.binDir.c_str(), instance, pd, device, ver, &seh);
+                Log("[ngx] VULKAN_Init_Ext(ver=0x%x) -> %#x (%s) seh=%#x",
+                    ver, (uint32_t)initResult, NgxResultName(initResult), seh);
+                if (NVSDK_NGX_SUCCEED(initResult)) { initializedVersion = ver; break; }
+            }
+            if (!NVSDK_NGX_SUCCEED(initResult) && s.initExt2) {
+                initResult = CallInitExtSafely(s.initExt2, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
+                    s.binDir.c_str(), instance, pd, device, ver, &seh);
+                Log("[ngx] VULKAN_Init_Ext2(ver=0x%x) -> %#x (%s) seh=%#x",
+                    ver, (uint32_t)initResult, NgxResultName(initResult), seh);
+                if (NVSDK_NGX_SUCCEED(initResult)) { initializedVersion = ver; break; }
+            }
+            if (!NVSDK_NGX_SUCCEED(initResult) && s.initPlain) {
+                initResult = CallInitExtSafely(s.initPlain, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
+                    s.binDir.c_str(), instance, pd, device, ver, &seh);
+                Log("[ngx] VULKAN_Init(ver=0x%x) -> %#x (%s) seh=%#x",
+                    ver, (uint32_t)initResult, NgxResultName(initResult), seh);
+                if (NVSDK_NGX_SUCCEED(initResult)) { initializedVersion = ver; break; }
+            }
         }
-        if (!NVSDK_NGX_SUCCEED(initResult) && s.initExt2) {
-            initResult = CallInitExtSafely(s.initExt2, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
-                s.binDir.c_str(), instance, pd, device, ver, &seh);
-            Log("[ngx] VULKAN_Init_Ext2(ver=0x%x) -> %#x seh=%#x", ver, (uint32_t)initResult, seh);
-            if (NVSDK_NGX_SUCCEED(initResult)) break;
+        if (!NVSDK_NGX_SUCCEED(initResult)) {
+            Log("[ngx] stage=initialize failed: %#x (%s); disabling model",
+                (uint32_t)initResult, NgxResultName(initResult));
+            s.disabled = true;
+            return false;
         }
-        if (!NVSDK_NGX_SUCCEED(initResult) && s.initPlain) {
-            initResult = CallInitExtSafely(s.initPlain, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
-                s.binDir.c_str(), instance, pd, device, ver, &seh);
-            Log("[ngx] VULKAN_Init(ver=0x%x) -> %#x seh=%#x", ver, (uint32_t)initResult, seh);
-            if (NVSDK_NGX_SUCCEED(initResult)) break;
-        }
-    }
-    if (!NVSDK_NGX_SUCCEED(initResult)) {
-        Log("[ngx] snippet init failed, disabling layer");
-        s.disabled = true;
-        return false;
-    }
+        s.initialized = true;
 
-// Public Vulkan NGX contract: query Feature-18 requirements before create.
-    {
-        auto reqs2 = reinterpret_cast<FnVkGetFeatureReqs2>(
-            GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements"));
-        if (reqs2) {
-            DWORD seh2 = 0;
-            NVSDK_NGX_FeatureRequirements fr{};
-            NVSDK_NGX_Result r = Guarded([&] { return reqs2(instance, pd, &fr); },
-                                         NVSDK_NGX_Result_FAIL_SEH, &seh2);
-            Log("[reqs] GetFeatureRequirements -> %#x seh=%#x ver=%u.%u flags=%#x minGPU=%u inGPU=%u cs=%u.%u",
-                (uint32_t)r, seh2, fr.Version.Major, fr.Version.Minor, fr.FeatureFlags,
-                fr.MinGPUMode, fr.InGPUMode, fr.MinCSMajorVersion, fr.MinCSMinorVersion);
-            if (NVSDK_NGX_SUCCEED(r)) {
-                s.featureFlags = fr.FeatureFlags;
-                s.hdrCapable = (fr.FeatureFlags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0u;
-                s.hdrActive = wantHdr && s.hdrCapable;
+        // The bundled snippet export accepts the four-argument public discovery ABI.
+        // This is diagnostic only: its support mask has no HDR capability bit, and
+        // failure to query must not replace the actual CreateFeature result.
+        {
+            auto reqs = reinterpret_cast<FnVkGetFeatureRequirements>(
+                GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements"));
+            if (reqs) {
+                DWORD seh2 = 0;
+                NVSDK_NGX_FeatureDiscoveryInfo discovery{};
+                discovery.SDKVersion = initializedVersion;
+                discovery.FeatureID = FEATURE_DLSSNR;
+                discovery.Identifier.IdentifierType = 0;
+                discovery.Identifier.v.ApplicationId = DLSSNR_SIGNED_SNIPPET_APPLICATION_ID;
+                discovery.ApplicationDataPath = s.binDir.c_str();
+                NVSDK_NGX_FeatureRequirement requirement{};
+                NVSDK_NGX_Result r = Guarded([&] { return reqs(instance, pd, &discovery, &requirement); },
+                                            NVSDK_NGX_Result_FAIL_SEH, &seh2);
+                Log("[reqs] GetFeatureRequirements -> %#x (%s) seh=%#x",
+                    (uint32_t)r, NgxResultName(r), seh2);
+                if (NVSDK_NGX_SUCCEED(r)) {
+                    Log("[reqs] supportMask=%#x minHWArchitecture=%#x minOS=%.*s (diagnostic only)",
+                        requirement.FeatureSupported, requirement.MinHWArchitecture,
+                        (int)sizeof(requirement.MinOSVersion), requirement.MinOSVersion);
+                } else {
+                    Log("[reqs] support unknown; checking actual feature creation");
+                }
+            } else {
+                Log("[reqs] GetFeatureRequirements export absent; checking actual feature creation");
             }
         }
     }
 
-    // Tonemapping hint now that the snippet's feature flags are known: SDR by default (the input is
-    // LDR RGBA8); HDR only when both asked for and advertised.
-    {
-        DWORD seh2 = 0;
-        const bool hdrPath = wantHdr && s.hdrCapable;
-        ParamSetUI(s.params, "DLSSNR.Hdr", hdrPath ? 1u : 0u, &seh2);
-        ParamSetUI(s.params, "DLSSNR.SDR", hdrPath ? 0u : 1u, &seh2);
-        Log("[params] tonemap hint: %s (featureFlags=%#x)", hdrPath ? "HDR" : "SDR", s.featureFlags);
-    }
+    s.hdrActive = wantHdr;
+    Log("[params] tonemap requested: %s", s.hdrActive ? "HDR" : "SDR");
 
     // Last, so neither the create contract above nor the tonemap hint can overwrite it. Its preset
     // write in particular used to land after everything the caller chose.
@@ -450,16 +533,18 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
 
     bool created = NgxCreatePass(s, 0, width, height, recordingCmd);
     if (!created && s.snippet && s.params) {
-        auto reqs = reinterpret_cast<FnVkGetFeatureRequirements>(
-            GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements"));
-        if (reqs) {
+        if (s.ownParams) {
+            Log("[diag] DLSSNR.Available=unknown (local parameter block has no capability result)");
+        } else {
             DWORD seh3 = 0;
-            NVSDK_NGX_Result r = Guarded([&] { return reqs(instance, pd, s.params); },
-                                         NVSDK_NGX_Result_FAIL_SEH, &seh3);
-            Log("[diag] GetFeatureRequirements -> %#x seh=%#x", (uint32_t)r, seh3);
             unsigned int avail = 0;
-            ParamGetUI(s.params, "DLSSNR.Available", &avail, &seh3);
-            Log("[diag] DLSSNR.Available=%u", avail);
+            NVSDK_NGX_Result r = Guarded([&] { return s.params->Get("DLSSNR.Available", &avail); },
+                                         NVSDK_NGX_Result_FAIL_SEH, &seh3);
+            if (NVSDK_NGX_SUCCEED(r))
+                Log("[diag] DLSSNR.Available=%u", avail);
+            else
+                Log("[diag] DLSSNR.Available=unknown (Get -> %#x (%s) seh=%#x)",
+                    (uint32_t)r, NgxResultName(r), seh3);
         }
     }
     return created;
@@ -501,8 +586,8 @@ void NgxReleaseAllPasses(NgxSnippet& s, VkDevice device) {
 }
 
 void NgxSetHdr(NgxSnippet& s, bool want) {
-    // Raw: the caller decides, the create either succeeds or the helper falls back. Clamping to
-    // hdrCapable here would silently swallow the request before init has learned the capability.
+    // The caller selects the input contract; actual feature creation determines
+    // whether it is accepted, with SDR fallback owned by the helper.
     s.hdrActive = want;
 }
 
@@ -542,9 +627,14 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
         FEATURE_DLSSNR, s.params, &s.features[pass], &seh);
     const double ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
-    Log("[ngx] VULKAN_CreateFeature(18) pass %u -> %#x seh=%#x handle=%p size=%ux%u in %.0f ms",
-        pass, (uint32_t)createResult, seh, (void*)s.features[pass], width, height, ms);
+    Log("[ngx] VULKAN_CreateFeature(18) pass %u -> %#x (%s) seh=%#x handle=%p size=%ux%u in %.0f ms",
+        pass, (uint32_t)createResult, NgxResultName(createResult), seh,
+        (void*)s.features[pass], width, height, ms);
     if (!NVSDK_NGX_SUCCEED(createResult) || !s.features[pass]) {
+        Log("[ngx] stage=create failed: pass=%u result=%#x (%s) validHandle=%d",
+            pass, (uint32_t)createResult, NgxResultName(createResult), int(s.features[pass] != nullptr));
+        if (createResult == NVSDK_NGX_Result_FAIL_PlatformError)
+            Log("[ngx] PlatformError does not identify the failing dependency; check runtime and driver logs");
         s.features[pass] = nullptr;
         // Only the first pass failing is fatal; a later one failing simply caps the chain, which is
         // what a memory ceiling looks like and is not a reason to lose the pass altogether.
@@ -692,7 +782,8 @@ bool NgxEvaluatePass(NgxSnippet& s, uint32_t pass, VkCommandBuffer recordingCmd)
     NVSDK_NGX_Result r =
         CallEvaluateSafely(s.evaluateFeature, recordingCmd, s.features[pass], s.params, &seh);
     if (!NVSDK_NGX_SUCCEED(r)) {
-        Log("[ngx] VULKAN_EvaluateFeature -> %#x seh=%#x (disabling)", (uint32_t)r, seh);
+        Log("[ngx] stage=evaluate VULKAN_EvaluateFeature -> %#x (%s) seh=%#x (disabling)",
+            (uint32_t)r, NgxResultName(r), seh);
         s.disabled = true;
         return false;
     }
@@ -710,7 +801,7 @@ void NgxTeardown(NgxSnippet& s, VkDevice device) {
         s.features[i] = nullptr;
     }
     s.featureCount = 0;
-    if (s.shutdown1) {
+    if (s.shutdown1 && s.initialized) {
         NVSDK_NGX_Result r = CallShutdownSafely(s.shutdown1, device, &seh);
         Log("[ngx] snippet Shutdown1 -> %#x seh=%#x", (uint32_t)r, seh);
     }
@@ -728,7 +819,8 @@ void NgxTeardown(NgxSnippet& s, VkDevice device) {
     RemoveCallerSpoof(g_coreSpoof);
     if (s.core) { FreeLibrary(s.core); s.core = nullptr; }
     if (s.snippet) { FreeLibrary(s.snippet); s.snippet = nullptr; }
-    s.ready = false;
+    if (s.nvapi) { FreeLibrary(s.nvapi); s.nvapi = nullptr; }
+    s = {};
 }
 
 }  // namespace dlssnr

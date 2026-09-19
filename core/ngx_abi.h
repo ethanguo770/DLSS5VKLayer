@@ -1,6 +1,7 @@
 #pragma once
 // Minimal NGX Vulkan ABI. Vtable order and Init_Ext signature per verified reference.
 #include <windows.h>
+#include <cstddef>
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
@@ -12,9 +13,9 @@ enum NVSDK_NGX_Result
 {
     NVSDK_NGX_Result_Success                   = 0x1,
     NVSDK_NGX_Result_Fail                      = (int)0xBAD00000,
-    NVSDK_NGX_Result_FAIL_Failure              = (int)0xBAD00001,
-    NVSDK_NGX_Result_FAIL_PlatformError        = (int)0xBAD00002,  // caller-module gate
-    NVSDK_NGX_Result_FAIL_IncompatibleTypes    = (int)0xBAD00003,
+    NVSDK_NGX_Result_FAIL_FeatureNotSupported  = (int)0xBAD00001,
+    NVSDK_NGX_Result_FAIL_PlatformError        = (int)0xBAD00002,
+    NVSDK_NGX_Result_FAIL_FeatureAlreadyExists = (int)0xBAD00003,
     NVSDK_NGX_Result_FAIL_FeatureNotFound      = (int)0xBAD00004,
     NVSDK_NGX_Result_FAIL_InvalidParameter     = (int)0xBAD00005,
     NVSDK_NGX_Result_FAIL_ScratchBufferTooSmall= (int)0xBAD00006,
@@ -32,7 +33,10 @@ enum NVSDK_NGX_Result
     NVSDK_NGX_Result_FAIL_NotImplemented       = (int)0xBAD00012,
     NVSDK_NGX_Result_FAIL_SEH                  = (int)0x8BADF00D,
 };
-#define NVSDK_NGX_SUCCEED(r) (((r) & 0xFFF00000) != 0xBAD00000)
+// FAIL_SEH is our exception sentinel, outside NGX's reserved error-code range.
+constexpr bool NVSDK_NGX_SUCCEED(NVSDK_NGX_Result r) {
+    return r != NVSDK_NGX_Result_FAIL_SEH && (r & 0xFFF00000) != 0xBAD00000;
+}
 
 typedef unsigned long long NVSDK_NGX_ULONGLONG;
 typedef unsigned int NVSDK_NGX_Version;
@@ -40,7 +44,41 @@ typedef unsigned int NVSDK_NGX_Version;
 #define NVSDK_NGX_Version_API_14 0x00000014u
 
 struct NVSDK_NGX_Handle;
-struct NVSDK_NGX_FeatureDiscoveryInfo; // opaque; passed as nullptr
+struct NVSDK_NGX_FeatureCommonInfo;
+
+// Public NGX discovery ABI. Requirement support bits describe platform support,
+// not DLSS create flags or HDR capability.
+// https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx_defs.h
+struct NVSDK_NGX_ProjectIdDescription {
+    const char* ProjectId;
+    int EngineType;
+    const char* EngineVersion;
+};
+struct NVSDK_NGX_Application_Identifier {
+    int IdentifierType; // 0 = application id, 1 = project id
+    union {
+        NVSDK_NGX_ProjectIdDescription ProjectDesc;
+        unsigned long long ApplicationId;
+    } v;
+};
+struct NVSDK_NGX_FeatureDiscoveryInfo {
+    NVSDK_NGX_Version SDKVersion;
+    int FeatureID;
+    NVSDK_NGX_Application_Identifier Identifier;
+    const wchar_t* ApplicationDataPath;
+    const NVSDK_NGX_FeatureCommonInfo* FeatureInfo;
+};
+struct NVSDK_NGX_FeatureRequirement {
+    unsigned int FeatureSupported; // 0 = supported, otherwise platform support bits
+    unsigned int MinHWArchitecture;
+    char MinOSVersion[255];
+};
+static_assert(sizeof(NVSDK_NGX_FeatureRequirement) == 264);
+static_assert(offsetof(NVSDK_NGX_FeatureRequirement, MinOSVersion) == 8);
+#ifdef _WIN64
+static_assert(sizeof(NVSDK_NGX_FeatureDiscoveryInfo) == 56);
+static_assert(offsetof(NVSDK_NGX_FeatureDiscoveryInfo, ApplicationDataPath) == 40);
+#endif
 
 // Canonical NVIDIA Vulkan resource layout (union of image-view / buffer info).
 enum NVSDK_NGX_Resource_VK_Type
@@ -157,15 +195,7 @@ typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkGetScratchBufferSize)(
 
 // ---- core (nvngx.dll) Vulkan export signatures ----
 typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkAllocateParameters)(NVSDK_NGX_Parameter** parameters);
-typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkDestroyParameters)(NVSDK_NGX_Parameter* parameters);typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkGetFeatureRequirements)(VkInstance, VkPhysicalDevice, NVSDK_NGX_Parameter*);
-
-struct NVSDK_NGX_SDK_VERSION { unsigned int Major; unsigned int Minor; };
-struct NVSDK_NGX_FeatureRequirements {
-    NVSDK_NGX_SDK_VERSION Version;
-    unsigned int FeatureFlags;
-    unsigned int MinGPUMode;
-    unsigned int InGPUMode;
-    unsigned int MinCSMajorVersion;
-    unsigned int MinCSMinorVersion;
-};
-typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkGetFeatureReqs2)(VkInstance, VkPhysicalDevice, NVSDK_NGX_FeatureRequirements*);
+typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkDestroyParameters)(NVSDK_NGX_Parameter* parameters);
+typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkGetFeatureRequirements)(
+    VkInstance, VkPhysicalDevice, const NVSDK_NGX_FeatureDiscoveryInfo*,
+    NVSDK_NGX_FeatureRequirement*);
