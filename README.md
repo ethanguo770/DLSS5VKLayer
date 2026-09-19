@@ -45,8 +45,10 @@ The output name stays fixed at `dist/dlssnr-ubuntu22.04-x86_64.tar.gz`, with
 its extracted directory and SHA256 file beside it. Repeating the build replaces
 the previous package only after the new package is complete. A failed build
 keeps the last working package. Do not add commit IDs or dates to routine builds.
-For the personal dual-model build, keep one model input folder at `build/models`
-and pass `--binaries build/models`. Reuse `build/package.log` and
+The current test DLLs are available through [the model download guide](models/README.md),
+with a GitHub Release archive for another computer. Extract it into `models/`.
+For the personal dual-model build, use that fixed model folder
+and pass `--binaries models`. Reuse `build/package.log` and
 `build/verification.log` for the latest build and checks.
 
 The bundle builder downloads and verifies pinned runtime archives and copies

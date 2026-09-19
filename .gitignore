@@ -2,8 +2,10 @@
 /build/
 /dist/
 
-# Proprietary NGX binaries, imported per-machine and never redistributable here
+# Local model imports; shared test DLLs are downloadable from GitHub Releases
 /binaries/
+/models/*.dll
+/models/rtx40/*.dll
 
 # Editor and tooling leftovers
 *.o
