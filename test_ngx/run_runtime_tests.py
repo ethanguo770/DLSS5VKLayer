@@ -12,15 +12,19 @@ import shutil
 import subprocess
 import tempfile
 
+CASES = ['runtime', 'bundled', 'query-error', 'create-error', 'create-exception',
+         'evaluate-exception', 'hdr-fallback', 'resize', 'query-unsupported',
+         'query-adapter-unsupported', 'profile-rtx40', 'profile-rtx40-laptop',
+         'profile-rtx40-resize', 'profile-rtx50', 'profile-flat40',
+         'profile-workstation', 'profile-other-vendor', 'profile-unknown']
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir', type=Path, default=Path('build/windows/windows'))
     parser.add_argument('--wine', type=Path)
     parser.add_argument('--executable', type=Path)
-    parser.add_argument('--case', choices=['runtime', 'bundled', 'query-error', 'create-error',
-                                          'create-exception', 'evaluate-exception', 'hdr-fallback',
-                                          'resize', 'query-unsupported'])
+    parser.add_argument('--case', choices=CASES)
     args = parser.parse_args()
     build = args.build_dir.resolve()
     executable = (args.executable or build / 'ngx_runtime_test.exe').resolve()
@@ -31,9 +35,7 @@ def main():
     if os.name != 'nt' and not args.wine:
         parser.error('Linux tests require --wine; a temporary prefix will be used')
 
-    cases = [args.case] if args.case else ['runtime', 'bundled', 'query-error', 'create-error',
-                                         'create-exception', 'evaluate-exception', 'hdr-fallback',
-                                         'resize', 'query-unsupported']
+    cases = [args.case] if args.case else list(CASES)
     if os.name == 'nt' and 'bundled' in cases:
         # Windows may already provide a real NVAPI in system32. The fallback case
         # requires an isolated Wine prefix where that runtime can be absent.
@@ -62,6 +64,18 @@ def main():
                 model.mkdir(parents=True)
                 shutil.copy2(executable, work / 'ngx_runtime_test.exe')
                 shutil.copy2(build / 'ngx_mock_snippet.dll', model / 'nvngx_dlssnr.dll')
+                selected_model = model
+                if case.startswith('profile-') and case != 'profile-flat40':
+                    candidate = model / 'rtx40'
+                    candidate.mkdir()
+                    if case.startswith('profile-rtx40'):
+                        selected_model = candidate
+                        shutil.copy2(build / 'ngx_mock_snippet.dll', candidate / 'nvngx_dlssnr.dll')
+                        # A wrong directory decision must fail actual LoadLibrary,
+                        # independently of the selected-profile log message.
+                        (model / 'nvngx_dlssnr.dll').write_text('wrong profile: not a DLL')
+                    else:
+                        (candidate / 'nvngx_dlssnr.dll').write_text('wrong profile: not a DLL')
                 # Wine uses the same system32 location as the real portable launcher.
                 # Native Windows uses the executable directory; never change system32.
                 runtime = fixture / 'prefix/drive_c/windows/system32/nvapi64.dll' if wine else work / 'nvapi64.dll'
@@ -85,6 +99,28 @@ def main():
                                          + result.stdout + result.stderr + output)
                 if 'DLSSNR.Available=0' in output or 'minGPU=' in output:
                     raise AssertionError('Misleading capability diagnostics: ' + output)
+                assert output.count('[model] profile=') == 1, output
+                assert '[model] version=310.8.42.0' in output, output
+                assert '[model] fileVersion=310.8.mock.0' in output, output
+                assert 'size=' in output and 'modifiedFileTime=' in output, output
+                loaded_path = windows_path(selected_model).replace('/', '\\').lower()
+                assert ('path=' + loaded_path + '\\nvngx_dlssnr.dll') in output.replace('/', '\\').lower(), output
+                if case.startswith('profile-rtx40'):
+                    assert '[model] profile=rtx40 reason=selected-vulkan-geforce-rtx40' in output, output
+                elif case == 'profile-rtx50':
+                    assert '[model] profile=rtx50' in output, output
+                elif case.startswith('profile-'):
+                    assert '[model] profile=flat' in output, output
+                if case == 'profile-flat40':
+                    assert 'reason=rtx40-profile-missing-using-flat-file' in output, output
+                if case == 'query-unsupported':
+                    for reason in ['CheckNotPresent', 'DriverVersionUnsupported', 'AdapterUnsupported',
+                                   'OSVersionBelowMinimumSupported', 'NotImplemented', 'UnknownBits',
+                                   'unknownBits=0x80', 'AD100/Ada', 'reportedSupport=not-confirmed']:
+                        assert reason in output, output
+                if case == 'query-adapter-unsupported':
+                    assert 'supportMask=0x4 (AdapterUnsupported)' in output, output
+                    assert 'GB200/Blackwell' in output and 'reportedSupport=not-confirmed' in output, output
                 if case in ('create-error', 'create-exception'):
                     assert 'created=true' not in output, output
                 else:

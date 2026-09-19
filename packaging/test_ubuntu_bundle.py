@@ -2,6 +2,8 @@
 """Regression checks for portable registration; needs no GPU or model DLL."""
 
 import ctypes.util
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,7 +14,36 @@ import tempfile
 import unittest
 
 
+sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parent.parent
+
+
+class ModelPackagingTests(unittest.TestCase):
+    def test_flat_and_rtx40_profiles_keep_distinct_files_and_hashes(self):
+        spec = importlib.util.spec_from_file_location('bundle_builder', REPO / 'packaging/make-ubuntu-bundle.py')
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source, output = base / 'source', base / 'output'
+            (source / 'rtx40').mkdir(parents=True)
+            (source / 'test-only').mkdir()
+            (source / 'nvngx_dlssnr.dll').write_bytes(b'universal model')
+            (source / 'rtx40/nvngx_dlssnr.dll').write_bytes(b'Ada candidate')
+            (source / 'test-only/ngx_mock.dll').write_bytes(b'not a production profile')
+            records = builder.copy_models(source, output)
+            self.assertEqual(set(records), {'nvngx_dlssnr.dll', 'rtx40/nvngx_dlssnr.dll'})
+            for relative, payload in [('nvngx_dlssnr.dll', b'universal model'),
+                                      ('rtx40/nvngx_dlssnr.dll', b'Ada candidate')]:
+                self.assertEqual((output / relative).read_bytes(), payload)
+                self.assertEqual(records[relative], {'size': len(payload),
+                                  'sha256': hashlib.sha256(payload).hexdigest()})
+            self.assertFalse((output / 'test-only').exists())
+            (source / 'rtx40/nvngx_dlssnr.dll').unlink()
+            with self.assertRaisesRegex(RuntimeError, 'RTX 40 profile'):
+                builder.copy_models(source, base / 'incomplete')
+            (source / 'rtx40').rmdir()
+            self.assertEqual(set(builder.copy_models(source, base / 'flat')), {'nvngx_dlssnr.dll'})
 
 
 class RegistrationTests(unittest.TestCase):

@@ -170,6 +170,21 @@ int main(int argc, char** argv) {
         check("close dispatches stop after start completes", readFile(calls).endsWith("start\nstop\n"));
     }
 
+    // A previously extracted package must not pin a new GUI to the old model set.
+    writeFile(base + "/old package/helper/binaries/nvngx_dlssnr.dll", "old bundled model");
+    writeFile(base + "/old package/bundle-metadata.json", "{}");
+    writeFile(config, ("runner_type=wine\nrunner_path=/bin/true\nbinaries=" +
+                      base + "/old package/helper/binaries\n").toUtf8());
+    {
+        MainWindow window;
+        auto* doctor = window.findChild<QPushButton*>("checkSetup");
+        doctor->click();
+        check("new package replaces saved old package model path", waitFor([&] { return doctor->isEnabled(); }) &&
+              readFile(config).contains(("binaries=" + base + "/install/helper/binaries").toUtf8()));
+        check("old package model is left intact",
+              readFile(base + "/old package/helper/binaries/nvngx_dlssnr.dll") == "old bundled model");
+    }
+
     // Model import into user data must take precedence over optional bundled files.
     writeFile(base + "/data/dlssnr/binaries/nvngx_dlssnr.dll", "user model");
     writeFile(config, "runner_type=wine\nrunner_path=/bin/true\n");

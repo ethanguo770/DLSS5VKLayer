@@ -6,8 +6,11 @@
 #include "guard.h"
 #include "logging.h"
 #include "ngx_param.h"
+#include "model_profile.h"
 #include <chrono>
 #include <cstring>
+#include <vector>
+#include <winver.h>
 
 namespace dlssnr {
 
@@ -217,14 +220,127 @@ static HMODULE LoadOptionalModule(const wchar_t* path, DWORD flags) {
 }
 
 static std::wstring ResolveBinDir() {
-    wchar_t env[MAX_PATH];
-    if (GetEnvironmentVariableW(L"DLSSNR_BIN_DIR", env, MAX_PATH) > 0 &&
+    wchar_t env[MAX_PATH]{};
+    const DWORD count = GetEnvironmentVariableW(L"DLSSNR_BIN_DIR", env, ARRAYSIZE(env));
+    if (count > 0 && count < ARRAYSIZE(env) &&
         FileExists(std::wstring(env) + L"\\nvngx_dlssnr.dll"))
         return env;
     std::wstring dir = ModuleDir();
     if (FileExists(dir + L"\\nvngx_dlssnr.dll")) return dir;
     if (FileExists(dir + L"\\binaries\\nvngx_dlssnr.dll")) return dir + L"\\binaries";
     return L"";
+}
+
+static std::wstring SelectModelDir(const std::wstring& root, const VkPhysicalDeviceProperties& gpu) {
+    const auto generation = ModelGeneration(gpu.vendorID, gpu.deviceName);
+    std::wstring selected = root;
+    const char* profile = "flat";
+    const char* reason = gpu.vendorID == 0x10de ? "unrecognized-geforce-generation" : "non-nvidia-or-unknown-device";
+    if (generation == GeForceGeneration::Rtx40) {
+        if (FileExists(root + L"\\rtx40\\nvngx_dlssnr.dll")) {
+            selected += L"\\rtx40";
+            profile = "rtx40";
+            reason = "selected-vulkan-geforce-rtx40";
+        } else {
+            reason = "rtx40-profile-missing-using-flat-file";
+        }
+    } else if (generation == GeForceGeneration::Rtx50) {
+        profile = "rtx50";
+        reason = "selected-vulkan-geforce-rtx50-using-base-file";
+    }
+    Log("[model] profile=%s reason=%s gpu=%s vendor=%#x device=%#x",
+        profile, reason, gpu.deviceName[0] ? gpu.deviceName : "unknown", gpu.vendorID, gpu.deviceID);
+    Log("[model] root=%ls selected=%ls", root.c_str(), selected.c_str());
+    return selected;
+}
+
+static void LogModelIdentity(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) {
+        const uint64_t size = (uint64_t(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+        const uint64_t modified = (uint64_t(attributes.ftLastWriteTime.dwHighDateTime) << 32) |
+                                  attributes.ftLastWriteTime.dwLowDateTime;
+        Log("[model] file=%ls size=%llu modifiedFileTime=%llu", path.c_str(),
+            (unsigned long long)size, (unsigned long long)modified);
+    } else {
+        Log("[model] file identity unavailable (error=%lu)", GetLastError());
+    }
+
+    // Version resources are diagnostic only. Resolve the Windows system API
+    // dynamically so missing metadata can never prevent the model from loading.
+    HMODULE version = LoadLibraryExW(L"version.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!version) {
+        Log("[model] version=unknown (version.dll unavailable, error=%lu)", GetLastError());
+        return;
+    }
+    const auto getSize = reinterpret_cast<decltype(&GetFileVersionInfoSizeW)>(
+        GetProcAddress(version, "GetFileVersionInfoSizeW"));
+    const auto getInfo = reinterpret_cast<decltype(&GetFileVersionInfoW)>(
+        GetProcAddress(version, "GetFileVersionInfoW"));
+    const auto query = reinterpret_cast<decltype(&VerQueryValueW)>(GetProcAddress(version, "VerQueryValueW"));
+    DWORD ignored = 0;
+    const DWORD size = getSize ? getSize(path.c_str(), &ignored) : 0;
+    bool logged = false;
+    if (getInfo && query && size && size <= 16 * 1024 * 1024) {
+        std::vector<unsigned char> resource(size);
+        if (getInfo(path.c_str(), 0, size, resource.data())) {
+            VS_FIXEDFILEINFO* fixed = nullptr;
+            UINT bytes = 0;
+            if (query(resource.data(), L"\\", reinterpret_cast<void**>(&fixed), &bytes) &&
+                fixed && bytes >= sizeof(*fixed) && fixed->dwSignature == 0xfeef04bd) {
+                Log("[model] version=%u.%u.%u.%u", HIWORD(fixed->dwFileVersionMS),
+                    LOWORD(fixed->dwFileVersionMS), HIWORD(fixed->dwFileVersionLS), LOWORD(fixed->dwFileVersionLS));
+                logged = true;
+            }
+            struct Translation { WORD language, codepage; };
+            Translation* translations = nullptr;
+            if (query(resource.data(), L"\\VarFileInfo\\Translation",
+                reinterpret_cast<void**>(&translations), &bytes) && translations && bytes >= sizeof(Translation)) {
+                wchar_t key[80]{};
+                _snwprintf(key, ARRAYSIZE(key), L"\\StringFileInfo\\%04x%04x\\FileVersion",
+                    translations[0].language, translations[0].codepage);
+                wchar_t* text = nullptr;
+                UINT chars = 0;
+                if (query(resource.data(), key, reinterpret_cast<void**>(&text), &chars) && text && chars) {
+                    Log("[model] fileVersion=%.*ls", int(chars > 256 ? 256 : chars), text);
+                    logged = true;
+                }
+            }
+        }
+    }
+    if (!logged) Log("[model] version=unknown (version resource absent or unreadable)");
+    FreeLibrary(version);
+}
+
+static void LogRequirements(const NVSDK_NGX_FeatureRequirement& requirement) {
+    // NVIDIA's public NGX support result is a mask of rejection/check failures;
+    // Success from GetFeatureRequirements only means the query itself succeeded.
+    const uint32_t mask = requirement.FeatureSupported;
+    std::string reasons;
+    const struct { uint32_t bit; const char* name; } known[] = {
+        {1, "CheckNotPresent"}, {2, "DriverVersionUnsupported"}, {4, "AdapterUnsupported"},
+        {8, "OSVersionBelowMinimumSupported"}, {16, "NotImplemented"},
+    };
+    for (const auto& entry : known) {
+        if (mask & entry.bit) {
+            if (!reasons.empty()) reasons += '|';
+            reasons += entry.name;
+        }
+    }
+    const uint32_t unknown = mask & ~0x1fu;
+    if (unknown) {
+        if (!reasons.empty()) reasons += '|';
+        reasons += "UnknownBits";
+    }
+    if (!mask) reasons = "Supported";
+    const char* architecture = "unknown";
+    if (requirement.MinHWArchitecture == 0x190) architecture = "AD100/Ada";
+    if (requirement.MinHWArchitecture == 0x1b0) architecture = "GB200/Blackwell";
+    Log("[reqs] supportMask=%#x (%s) unknownBits=%#x minHWArchitecture=%#x (%s) minOS=%.*s",
+        mask, reasons.c_str(), unknown, requirement.MinHWArchitecture, architecture,
+        (int)sizeof(requirement.MinOSVersion), requirement.MinOSVersion);
+    Log("[reqs] reportedSupport=%s; actual feature creation is still required",
+        mask ? "not-confirmed" : "supported");
 }
 
 static void RegisterPeRange(const char* name, HMODULE mod) {
@@ -239,14 +355,16 @@ static void RegisterPeRange(const char* name, HMODULE mod) {
 // ---------------------------------------------------------------------------
 static bool LoadModulesAndParameters(NgxSnippet& s, VkInstance instance,
                                     VkPhysicalDevice pd, VkDevice device) {
-    s.binDir = ResolveBinDir();
-    if (s.binDir.empty()) { Log("[ngx] nvngx_dlssnr.dll not found (set DLSSNR_BIN_DIR)"); s.disabled = true; return false; }
+    const auto root = ResolveBinDir();
+    if (root.empty()) { Log("[ngx] nvngx_dlssnr.dll not found (set DLSSNR_BIN_DIR)"); s.disabled = true; return false; }
+    s.binDir = SelectModelDir(root, s.deviceProperties);
     Log("[ngx] bin dir: %ls", s.binDir.c_str());
+    LogModelIdentity(s.binDir + L"\\nvngx_dlssnr.dll");
 
     s.snippet = LoadLibraryExW((s.binDir + L"\\nvngx_dlssnr.dll").c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!s.snippet) { Log("[ngx] LoadLibrary nvngx_dlssnr.dll failed (%lu)", GetLastError()); s.disabled = true; return false; }
-    Log("[ngx] nvngx_dlssnr.dll loaded at %p", (void*)s.snippet);
+    LogModulePath("nvngx_dlssnr.dll", s.snippet);
     RegisterPeRange("nvngx_dlssnr.dll", s.snippet);
 
     s.initExt = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init_Ext"));
@@ -512,9 +630,7 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
                 Log("[reqs] GetFeatureRequirements -> %#x (%s) seh=%#x",
                     (uint32_t)r, NgxResultName(r), seh2);
                 if (NVSDK_NGX_SUCCEED(r)) {
-                    Log("[reqs] supportMask=%#x minHWArchitecture=%#x minOS=%.*s (diagnostic only)",
-                        requirement.FeatureSupported, requirement.MinHWArchitecture,
-                        (int)sizeof(requirement.MinOSVersion), requirement.MinOSVersion);
+                    LogRequirements(requirement);
                 } else {
                     Log("[reqs] support unknown; checking actual feature creation");
                 }

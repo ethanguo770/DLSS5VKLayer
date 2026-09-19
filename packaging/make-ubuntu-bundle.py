@@ -94,6 +94,27 @@ def copy_script(source, target):
     target.chmod(0o755)
 
 
+def copy_models(source, destination):
+    """Copy the flat model and the one supported automatic GPU profile."""
+    if not (source / 'nvngx_dlssnr.dll').is_file():
+        raise RuntimeError('--binaries must contain nvngx_dlssnr.dll')
+    records = {}
+    for relative_dir in ['', 'rtx40']:
+        folder = source / relative_dir
+        if not folder.is_dir():
+            continue
+        if relative_dir and not (folder / 'nvngx_dlssnr.dll').is_file():
+            raise RuntimeError('RTX 40 profile is missing nvngx_dlssnr.dll')
+        for file in sorted(folder.iterdir()):
+            if file.is_file() and file.name.lower().endswith(('.dll', '.license.txt')):
+                relative = file.relative_to(source)
+                target = destination / relative
+                copy(file, target)
+                records[relative.as_posix()] = {'size': target.stat().st_size,
+                                              'sha256': digest(target)}
+    return records
+
+
 def collect_libraries(inputs, destination, env=None, internal=None):
     destination.mkdir(parents=True, exist_ok=True)
     copied = {}
@@ -199,6 +220,7 @@ def build(args, repo, root):
     for document in ['LICENSE', 'ATTRIBUTION.md']:
         if (repo / document).is_file():
             copy(repo / document, root / 'notices' / document)
+    copy(repo / 'packaging/model-profiles.md', root / 'MODEL_PROFILES.md')
 
     qmake = shutil.which('qmake6')
     if not qmake:
@@ -253,15 +275,8 @@ def build(args, repo, root):
     metadata['wine_version_smoke'] = version
     metadata['runtime_dll_pins'] = pinned_runtime_dlls(repo, root, args.cache_dir)
     if args.binaries:
-        if not (args.binaries / 'nvngx_dlssnr.dll').is_file():
-            raise RuntimeError('--binaries must contain nvngx_dlssnr.dll')
-        metadata['model_files'] = {}
-        for source in args.binaries.iterdir():
-            if source.is_file() and source.name.lower().endswith(('.dll', '.license.txt')):
-                target = root / 'helper/binaries' / source.name
-                copy(source, target)
-                metadata['model_files'][source.name] = {
-                    'size': target.stat().st_size, 'sha256': digest(target)}
+        metadata['model_files'] = copy_models(args.binaries, root / 'helper/binaries')
+        metadata['automatic_rtx40_profile'] = 'rtx40/nvngx_dlssnr.dll' in metadata['model_files']
     (root / 'bundle-metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
 
 

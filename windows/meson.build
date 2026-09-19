@@ -26,7 +26,11 @@ executable('smoke', '../test_layer/smoke.cpp',
 )
 
 # Test-only DLLs exercise the actual Windows loader and NGX boundary without a GPU.
-shared_library('ngx_mock_snippet', '../test_ngx/mock_snippet.cpp',
+mock_version = custom_target('ngx_mock_version', input: '../test_ngx/mock_version.rc',
+  output: 'ngx_mock_version.o',
+  command: [find_program('x86_64-w64-mingw32-windres'), '@INPUT@', '@OUTPUT@'],
+)
+shared_library('ngx_mock_snippet', '../test_ngx/mock_snippet.cpp', mock_version,
   include_directories: windows_inc, link_args: windows_cpp_link_args,
   name_prefix: '', install: false,
 )

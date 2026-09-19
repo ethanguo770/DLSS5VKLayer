@@ -1,5 +1,6 @@
 #include "../core/ngx_snippet.h"
 #include "../core/guard.h"
+#include "../core/model_profile.h"
 #include <cstdio>
 #include <cstring>
 
@@ -8,12 +9,42 @@ static void Trace(const char* message) {
     WriteFile(GetStdHandle(STD_ERROR_HANDLE), message, (DWORD)std::strlen(message), &written, nullptr);
 }
 
+static bool CheckGeneration() {
+    using Generation = dlssnr::GeForceGeneration;
+    const struct { unsigned int vendor; const char* name; Generation expected; } cases[] = {
+        {0x10de, "NVIDIA GeForce RTX 4090", Generation::Rtx40},
+        {0x10de, "GeForce RTX 4070 Ti SUPER", Generation::Rtx40},
+        {0x10de, "NVIDIA GeForce RTX 4050 Laptop GPU", Generation::Rtx40},
+        {0x10de, "NVIDIA GeForce RTX 4090D", Generation::Rtx40},
+        {0x10de, "NVIDIA GeForce RTX 5090", Generation::Rtx50},
+        {0x10de, "NVIDIA GeForce RTX 5070 Ti Laptop GPU", Generation::Rtx50},
+        {0x10de, "NVIDIA RTX 4000 Ada Generation", Generation::Other},
+        {0x10de, "NVIDIA RTX PRO 5000 Blackwell", Generation::Other},
+        {0x10de, "NVIDIA GeForce RTX 40900", Generation::Other},
+        {0x10de, "NVIDIA GeForce RTX 4090 unknown", Generation::Other},
+        {0x10de, "NVIDIA GeForce RTX 4", Generation::Other},
+        {0x10de, "NVIDIA GeForce RTX 6090", Generation::Other},
+        {0x10de, "NVIDIA GeForce RTX 3090", Generation::Other},
+        {0x10de, "", Generation::Other},
+        {0x1002, "NVIDIA GeForce RTX 4090", Generation::Other},
+        {0, "NVIDIA GeForce RTX 5090", Generation::Other},
+    };
+    for (const auto& entry : cases) {
+        if (dlssnr::ModelGeneration(entry.vendor, entry.name) != entry.expected) {
+            std::fprintf(stderr, "Generation mismatch: vendor=%x name=%s\n", entry.vendor, entry.name);
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (argc != 4) {
         std::fprintf(stderr, "usage: ngx_runtime_test model-directory log-file mode\n");
         return 2;
     }
     Trace("[test] main entered\n");
+    if (!CheckGeneration()) return 1;
     SetEnvironmentVariableA("DLSSNR_BIN_DIR", argv[1]);
     SetEnvironmentVariableA("DLSSNR_LOG", argv[2]);
     SetEnvironmentVariableA("DLSSNR_TEST_MODE", argv[3]);
@@ -25,6 +56,15 @@ int main(int argc, char** argv) {
     Trace("[test] guard installed\n");
 
     dlssnr::NgxSnippet snippet;
+    snippet.deviceProperties.vendorID = 0x10de;
+    snippet.deviceProperties.deviceID = 0x2684;
+    const char* name = "NVIDIA GeForce RTX 4090";
+    if (std::strcmp(argv[3], "profile-rtx40-laptop") == 0) name = "NVIDIA GeForce RTX 4070 Laptop GPU";
+    if (std::strcmp(argv[3], "profile-rtx50") == 0) name = "NVIDIA GeForce RTX 5090";
+    if (std::strcmp(argv[3], "profile-workstation") == 0) name = "NVIDIA RTX 4000 Ada Generation";
+    if (std::strcmp(argv[3], "profile-unknown") == 0) name = "NVIDIA GeForce RTX 6090";
+    if (std::strcmp(argv[3], "profile-other-vendor") == 0) snippet.deviceProperties.vendorID = 0x1002;
+    std::strncpy(snippet.deviceProperties.deviceName, name, sizeof(snippet.deviceProperties.deviceName) - 1);
     const bool hdrFallback = std::strcmp(argv[3], "hdr-fallback") == 0;
     snippet.hdrActive = hdrFallback;
     Trace("[test] initializing NGX boundary\n");
@@ -41,12 +81,18 @@ int main(int argc, char** argv) {
             reinterpret_cast<VkPhysicalDevice>(0x2220), reinterpret_cast<VkDevice>(0x3330),
             2560, 1440, reinterpret_cast<VkCommandBuffer>(0x4440), {});
     }
-    if (ok && std::strcmp(argv[3], "resize") == 0) {
+    if (ok && (std::strcmp(argv[3], "resize") == 0 || std::strcmp(argv[3], "profile-rtx40-resize") == 0)) {
         const auto parameters = snippet.params;
+        const auto module = snippet.snippet;
+        const auto directory = snippet.binDir;
+        // Even a later change in the selection inputs must not reload an NGX
+        // context while its Vulkan device and feature lifetime remain active.
+        std::strcpy(snippet.deviceProperties.deviceName, "NVIDIA GeForce RTX 5090");
         ok = dlssnr::NgxLoadAndInit(snippet, reinterpret_cast<VkInstance>(0x1110),
             reinterpret_cast<VkPhysicalDevice>(0x2220), reinterpret_cast<VkDevice>(0x3330),
             1280, 720, reinterpret_cast<VkCommandBuffer>(0x4440), {});
         passed = passed && snippet.params == parameters && snippet.featureW == 1280 && snippet.featureH == 720;
+        passed = passed && snippet.snippet == module && snippet.binDir == directory;
     }
     const bool failCreate = std::strcmp(argv[3], "create-error") == 0 ||
                             std::strcmp(argv[3], "create-exception") == 0;

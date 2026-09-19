@@ -458,15 +458,14 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
 
     // The NVIDIA NGX DLLs, tucked into the settings menu rather than crowding the top of the window.
     // The path shows as a disabled header so the folder the helper reads stays discoverable; it refreshes
-    // after an import. These are NVIDIA's proprietary files and are not shipped, so Import copies the
-    // ones the user already owns into that folder -- exactly as `dlssnr-helper import-binaries` does --
-    // and the helper has to be restarted afterwards to load them.
+    // after an import. Import copies user-selected files and overrides bundled models;
+    // the helper has to be restarted afterwards to load them.
     gearMenu->addSeparator();
     auto* binariesMenu = gearMenu->addMenu("NGX binaries");
     binariesPathAction = binariesMenu->addAction(effectiveBinariesDir());
     binariesPathAction->setEnabled(false);
     binariesPathAction->setToolTip(FormatTip(
-        "Where the NVIDIA NGX DLLs live. The helper loads nvngx_dlssnr.dll from here.\n"
+        "Where the NVIDIA NGX DLLs live. Packages with both models select automatically for RTX 40/50.\n"
         "If no model is included in the package, import it from your existing files."));
     importBinariesAction = binariesMenu->addAction("Import binaries...", this, &MainWindow::importBinaries);
     importBinariesAction->setToolTip(FormatTip(
@@ -666,9 +665,15 @@ QString MainWindow::defaultBinariesDir() const {
 // elsewhere is only ever a hand-edit or a leftover from the CLI's discovery.
 QString MainWindow::effectiveBinariesDir() const {
     const QString configured = binariesPath.isEmpty() ? defaultBinariesDir() : binariesPath;
-    if (QFile::exists(configured + "/nvngx_dlssnr.dll")) return configured;
     const QString installDir = qEnvironmentVariable("DLSSNR_INSTALL_DIR");
     const QString bundled = installDir + "/helper/binaries";
+    // Opening a new portable package upgrades a saved path into an older package.
+    // Imported DLLs and other user-selected directories retain their precedence.
+    const bool previousBundle = QDir::cleanPath(configured).endsWith("/helper/binaries") &&
+        QFile::exists(QDir(configured).filePath("../../bundle-metadata.json"));
+    if (QFile::exists(configured + "/nvngx_dlssnr.dll") &&
+        !(previousBundle && !installDir.isEmpty() && QFile::exists(bundled + "/nvngx_dlssnr.dll")))
+        return configured;
     if (!installDir.isEmpty() && QFile::exists(bundled + "/nvngx_dlssnr.dll")) return bundled;
     return configured;
 }

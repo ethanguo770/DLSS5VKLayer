@@ -7,6 +7,11 @@ DLSSNR — Ubuntu 22.04 personal test package
 2. 已含模型的运行包直接点击 Start helper；未含模型时，首次在窗口中导入 nvngx_dlssnr.dll。
 3. 游戏保持原来的 VKLayer_DLSS5=1 启动方式。在同一窗口调节效果、对比和截图。
 
+双模型包会按实际使用的显卡自动选择：GeForce RTX 40 系使用 RTX40 候选，
+RTX 50 系使用 SF-v2。无需手动切换。日志会记录选择结果和 DLL 版本。
+更换包前先停止旧 helper。手动导入的模型目录仍优先；详细来源、哈希和
+兼容性验证范围见 MODEL_PROFILES.md。自动选择不等于已验证实际画面效果。
+
 Qt、Wine、DXVK 和 NVAPI 已随包提供，无需自行安装。若包内已有模型 DLL，
 界面会自动识别，无需导入。Check setup 用于检查，Details 显示准备进度和错误。
 显卡驱动由系统提供：需要支持 Vulkan 1.4 的 NVIDIA 驱动，版本 575.51.02

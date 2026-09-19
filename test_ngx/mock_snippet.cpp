@@ -57,8 +57,8 @@ EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_GetFeatureRequirements(
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     validQuery = true;
     if (Mode("query-error")) return NVSDK_NGX_Result_FAIL_InvalidParameter;
-    output->supported = Mode("query-unsupported") ? 2 : 0;
-    output->architecture = 0x1234;
+    output->supported = Mode("query-unsupported") ? 0x9f : Mode("query-adapter-unsupported") ? 4 : 0;
+    output->architecture = Mode("query-unsupported") ? 0x190 : Mode("query-adapter-unsupported") ? 0x1b0 : 0x1234;
     std::memset(output->os, 'X', sizeof(output->os)); // also tests bounded logging
     return NVSDK_NGX_Result_Success;
 }

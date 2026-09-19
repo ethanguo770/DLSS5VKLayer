@@ -27,6 +27,15 @@ sed -i "s|runner_path=.*|runner_path=$work/user-proton|" "$XDG_CONFIG_HOME/dlssn
 config="$(bash "$repo/dlssnr-helper" config)"
 [[ "$config" == *"runner_type=proton"* ]]
 [[ "$config" == *"runner_path=$work/user-proton"* ]]
+mkdir -p "$work/old package/helper/binaries" "$work/custom-models"
+touch "$work/old package/helper/binaries/nvngx_dlssnr.dll" "$work/old package/bundle-metadata.json" \
+      "$work/custom-models/nvngx_dlssnr.dll"
+printf '\nbinaries=%s\n' "$work/old package/helper/binaries" > "$XDG_CONFIG_HOME/dlssnr/config.ini"
+config="$(bash "$repo/dlssnr-helper" config)"
+[[ "$config" == *"binaries=$DLSSNR_INSTALL_DIR/helper/binaries"* ]]
+printf 'binaries=%s\n' "$work/custom-models" > "$XDG_CONFIG_HOME/dlssnr/config.ini"
+config="$(bash "$repo/dlssnr-helper" config)"
+[[ "$config" == *"binaries=$work/custom-models"* ]]
 rm "$XDG_CONFIG_HOME/dlssnr/config.ini"
 bash "$repo/dlssnr-helper" init >/dev/null
 config="$(bash "$repo/dlssnr-helper" config)"

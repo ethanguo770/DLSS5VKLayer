@@ -21,6 +21,12 @@ same window, with output under **Details**. Start your game as before, with
 `VKLayer_DLSS5=1`; game launching and rendering are unchanged. The interface
 continues to provide effect controls, comparisons and matched screenshots.
 
+Dual-model packages automatically select the RTX40 candidate for the helper's
+actual GeForce RTX 40-series Vulkan device and SF-v2 for GeForce RTX 50-series.
+No manual GPU switch is needed. Model identity and selection are logged;
+successful selection does not establish successful neural processing. See
+[model profiles and verified file sources](packaging/model-profiles.md).
+
 The launcher registers only its own user Vulkan manifests and leaves global
 environment settings alone. A conflicting older layer is reported in the
 interface and blocks startup; matching existing libraries are reused. Run the
@@ -38,7 +44,9 @@ python3 packaging/make-ubuntu-bundle.py
 The bundle builder downloads and verifies pinned runtime archives and copies
 runtime libraries from the build host. It fails on missing libraries or invalid
 hashes. Optional `--binaries /path/to/dlls` includes an existing model directory;
-without it, model import stays in the GUI. See the bundle's `README.txt` and
+without that option, model import stays in the GUI. An optional
+`rtx40/nvngx_dlssnr.dll` inside the directory supplies the RTX 40 profile.
+See the bundle's `README.txt` and
 `bundle-metadata.json` for contents and host requirements. Build-time packages
 also include `qt6-wayland`, X11 development headers, `libsane1` and
 `libxkbregistry0`; these are handled by the packager, not the end user.

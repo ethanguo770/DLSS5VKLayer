@@ -103,8 +103,12 @@ load_config() {
     runner_type="wine"
     runner_path="$DLSSNR_BUNDLED_RUNNER"
   fi
-  if [ ! -f "$binaries/nvngx_dlssnr.dll" ] &&
-     [ -f "${DLSSNR_INSTALL_DIR:-}/helper/binaries/nvngx_dlssnr.dll" ]; then
+  # New portable packages replace a saved path into an older package, while
+  # imported/user-selected flat model directories retain precedence.
+  if { [ ! -f "$binaries/nvngx_dlssnr.dll" ] ||
+       { [[ "$binaries" == */helper/binaries ]] && [ -f "$binaries/../../bundle-metadata.json" ]; }; } &&
+     [ -n "${DLSSNR_INSTALL_DIR:-}" ] &&
+     [ -f "$DLSSNR_INSTALL_DIR/helper/binaries/nvngx_dlssnr.dll" ]; then
     binaries="$DLSSNR_INSTALL_DIR/helper/binaries"
   fi
   # A config written by an older build pins the mapping to $XDG_RUNTIME_DIR, which is exactly the

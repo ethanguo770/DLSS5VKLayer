@@ -195,6 +195,7 @@ struct GpuImage {
 struct VkCtx {
     VkInstance instance = nullptr;
     VkPhysicalDevice physical = nullptr;
+    VkPhysicalDeviceProperties deviceProperties{};
     VkDevice device = nullptr;
     VkQueue queue = nullptr;
     uint32_t queueFamily = 0;
@@ -340,7 +341,11 @@ static bool CreateContext(VkCtx& c) {
         if (props.vendorID != 0x10DE) continue;
         if (!HasDeviceExt(p, "VK_NVX_binary_import") || !HasDeviceExt(p, "VK_NVX_image_view_handle")) continue;
         c.physical = p;
+        c.deviceProperties = props;
         Log("[helper] device: %s", props.deviceName);
+        Log("[helper] selected Vulkan GPU vendor=%#x device=%#x api=%u.%u.%u driverVersion=%#x",
+            props.vendorID, props.deviceID, VK_VERSION_MAJOR(props.apiVersion),
+            VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion), props.driverVersion);
         break;
     }
     if (!c.physical) { Log("[helper] no NVIDIA device with NVX exts"); return false; }
@@ -2317,6 +2322,7 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     NgxTuning first = TuningFor(shm.hdr, 0);
 
     if (!BeginCmd(ns.vk.cmdCreate)) return false;
+    if (!ns.ngx.initialized) ns.ngx.deviceProperties = ns.vk.deviceProperties;
     bool ok = NgxLoadAndInit(ns.ngx, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h, ns.vk.cmdCreate, first);
     if (!SubmitAndWait(ns.vk, ns.vk.cmdCreate) || !ok) {
         if (ns.hdrBuilt) {

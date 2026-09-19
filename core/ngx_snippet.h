@@ -57,6 +57,9 @@ struct NgxSnippet {
     NVSDK_NGX_Resource_VK resColor{}, resOut{}, resMV{}, resDepth{};
 
     std::wstring binDir;
+    // Captured from the physical device used by the helper, before first init.
+    // The model directory is then held for the entire NGX context lifetime.
+    VkPhysicalDeviceProperties deviceProperties{};
 };
 
 // Layer module handle (set in DllMain), used as the spoofed caller identity.
